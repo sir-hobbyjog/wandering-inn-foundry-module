@@ -10,25 +10,46 @@ function actorOptionsHtml() {
   return actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("\n");
 }
 
+function panelStateFromHtml(html) {
+  return {
+    actorId: String(html.find("#wi-actor").val() || ""),
+    npcId: String(html.find("#wi-npc-id").val() || ""),
+    archetypeId: String(html.find("#wi-arch").val() || "innkeeper_npc"),
+    level: Number(html.find("#wi-level").val() || 10),
+    message: String(html.find("#wi-msg").val() || "")
+  };
+}
+
 export function registerNpcPanel() {
   game.wiCore = game.wiCore || {};
-  game.wiCore.openNpcPanel = () => {
+  game.wiCore.openNpcPanel = (initial = {}) => {
+    const state = {
+      actorId: String(initial.actorId || ""),
+      npcId: String(initial.npcId || ""),
+      archetypeId: String(initial.archetypeId || "innkeeper_npc"),
+      level: Number(initial.level || 10),
+      message: String(initial.message || "")
+    };
     const content = `
 <div class="wi-core-grid">
   <label>Actor</label><select id="wi-actor">${actorOptionsHtml()}</select>
-  <label>NPC ID</label><input id="wi-npc-id" type="text" placeholder="erin_solstice_early" />
-  <label>Archetype</label><input id="wi-arch" type="text" value="innkeeper_npc" />
-  <label>Level</label><input id="wi-level" type="number" value="10" />
-  <label>Message</label><textarea id="wi-msg" rows="4" placeholder="Ask the NPC..."></textarea>
+  <label>NPC ID</label><input id="wi-npc-id" type="text" placeholder="erin_solstice_early" value="${state.npcId}" />
+  <label>Archetype</label><input id="wi-arch" type="text" value="${state.archetypeId}" />
+  <label>Level</label><input id="wi-level" type="number" value="${state.level}" />
+  <label>Message</label><textarea id="wi-msg" rows="4" placeholder="Ask the NPC...">${state.message}</textarea>
 </div>`;
 
     new Dialog({
       title: "Wandering Inn NPC Panel",
       content,
+      render: (html) => {
+        if (state.actorId) html.find("#wi-actor").val(state.actorId);
+      },
       buttons: {
         bind: {
           label: "Bind Actor",
           callback: async (html) => {
+            const next = panelStateFromHtml(html);
             const actor = game.actors.get(html.find("#wi-actor").val());
             if (!actor) return;
             await bindActorToNpc(actor, {
@@ -38,20 +59,24 @@ export function registerNpcPanel() {
               isCanon: true
             });
             ui.notifications.info("Actor bound to NPC");
+            game.wiCore.openNpcPanel(next);
           }
         },
         pull: {
           label: "Pull Combat",
           callback: async (html) => {
+            const next = panelStateFromHtml(html);
             const actor = game.actors.get(html.find("#wi-actor").val());
             if (!actor) return;
             await pullCombatToActor(actor, { levelOverride: Number(html.find("#wi-level").val() || 1) });
             ui.notifications.info("Combat profile applied to actor");
+            game.wiCore.openNpcPanel(next);
           }
         },
         send: {
           label: "Send NPC Prompt",
           callback: async (html) => {
+            const next = panelStateFromHtml(html);
             const npcId = String(html.find("#wi-npc-id").val() || "").trim();
             const msg = String(html.find("#wi-msg").val() || "").trim();
             if (!npcId || !msg) return ui.notifications.warn("NPC ID and message are required");
@@ -76,6 +101,7 @@ export function registerNpcPanel() {
             await ChatMessage.create({
               content: `<strong>${npcId}</strong>: ${response.response}<br/><small>Citations: ${cites || "none"}</small>`
             });
+            ui.notifications.info("NPC response posted to Chat Log.");
 
             if (voiceId) {
               await maybePlayVoice({
@@ -85,6 +111,8 @@ export function registerNpcPanel() {
                 voiceId
               });
             }
+            next.message = "";
+            game.wiCore.openNpcPanel(next);
           }
         }
       },

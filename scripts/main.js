@@ -86,25 +86,7 @@ function registerSettings() {
   });
 }
 
-Hooks.once("init", () => {
-  registerSettings();
-  registerNpcPanel();
-});
-
-Hooks.once("ready", async () => {
-  registerActorSyncHook();
-
-  try {
-    const health = await apiRequest("/health");
-    console.log("[wi-core-foundry] API health", health);
-  } catch (err) {
-    console.error("[wi-core-foundry] API health check failed", err);
-  }
-
-  game.wiCore = game.wiCore || {};
-  game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
-  game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
-
+function registerKeybindings() {
   game.keybindings.register(MODULE_ID, "openNpcPanel", {
     name: "Open NPC Panel",
     hint: "Open the Wandering Inn NPC panel.",
@@ -136,4 +118,25 @@ Hooks.once("ready", async () => {
       return true;
     }
   });
+}
+
+Hooks.once("init", () => {
+  registerSettings();
+  registerNpcPanel();
+  registerKeybindings();
+});
+
+Hooks.once("ready", async () => {
+  registerActorSyncHook();
+
+  try {
+    const health = await apiRequest("/health");
+    console.log("[wi-core-foundry] API health", health);
+  } catch (err) {
+    console.error("[wi-core-foundry] API health check failed", err);
+  }
+
+  game.wiCore = game.wiCore || {};
+  game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
+  game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
 });
