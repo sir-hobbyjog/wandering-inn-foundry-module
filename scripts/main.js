@@ -103,12 +103,36 @@ Hooks.once("ready", async () => {
 
   game.wiCore = game.wiCore || {};
   game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
+  game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
 
   game.keybindings.register(MODULE_ID, "openNpcPanel", {
     name: "Open NPC Panel",
+    hint: "Open the Wandering Inn NPC panel.",
+    editable: [{ key: "KeyN", modifiers: ["Shift", "Alt"] }],
+    onDown: () => {
+      game.wiCore.openNpcPanel();
+      return true;
+    }
+  });
+
+  game.keybindings.register(MODULE_ID, "openNpcPanelGM", {
+    name: "Open NPC Panel (GM)",
+    hint: "GM-only shortcut to open the Wandering Inn NPC panel.",
+    restricted: true,
     editable: [{ key: "KeyI", modifiers: ["Control", "Shift"] }],
     onDown: () => {
       game.wiCore.openNpcPanel();
+      return true;
+    }
+  });
+
+  game.keybindings.register(MODULE_ID, "pullCombatSelected", {
+    name: "Pull Combat for Selected Token",
+    hint: "GM-only shortcut: pull combat snapshot and apply it to selected token actor.",
+    restricted: true,
+    editable: [{ key: "KeyP", modifiers: ["Shift", "Alt"] }],
+    onDown: () => {
+      game.wiCore.pullCombatSelected().catch((err) => console.error("[wi-core-foundry] pull hotkey failed", err));
       return true;
     }
   });

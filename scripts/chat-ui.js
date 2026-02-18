@@ -91,4 +91,16 @@ export function registerNpcPanel() {
       default: "send"
     }).render(true);
   };
+
+  // Convenience helper for hotkeys: pull combat onto the first selected token actor.
+  game.wiCore.pullCombatSelected = async () => {
+    const token = canvas?.tokens?.controlled?.[0];
+    const actor = token?.actor;
+    if (!actor) {
+      ui.notifications.warn("Select a token first.");
+      return;
+    }
+    await pullCombatToActor(actor, {});
+    ui.notifications.info(`Pulled combat profile for ${actor.name}.`);
+  };
 }
