@@ -1,0 +1,30 @@
+{
+  "id": "wi-core-foundry",
+  "title": "Wandering Inn Core Bridge",
+  "description": "Foundry v12 bridge for NPC chat, combat sync, and voice using the local Campaign Core API.",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "12"
+  },
+  "authors": [
+    {
+      "name": "Wandering Inn Campaign Core"
+    }
+  ],
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "styles": [
+    "styles/module.css"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "lang/en.json"
+    }
+  ],
+  "manifest": "https://raw.githubusercontent.com/sir-hobbyjog/wandering-inn-foundry-module/main/module.json",
+  "download": "https://github.com/sir-hobbyjog/wandering-inn-foundry-module/releases/download/v0.1.0/wi-core-foundry-v0.1.0.zip"
+}
