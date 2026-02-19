@@ -797,7 +797,6 @@ ${historyRows}
     </div>
     <div class="wi-bulk-actions">
       <button type="button" data-action="bulk-xp">Award XP to Party</button>
-      <button type="button" data-action="bulk-mark-session">Mark Session</button>
       <button type="button" data-action="bulk-freeze">Freeze Leveling</button>
     </div>
     <div class="wi-roster-list">${roster || "<p>No party actors found in the current scene.</p>"}</div>
@@ -817,7 +816,6 @@ ${historyRows}
     <h4>Validation Issues</h4>
     <ul>${issueRows}</ul>
     <h4>Player Requests</h4>
-    <button type="button" data-action="create-request">New Request</button>
     <ul>${requestRows}</ul>
     <h4>Session Marks</h4>
     <ul>${markRows}</ul>
@@ -911,9 +909,7 @@ ${historyRows}
       if (action === "refresh-history") return this._onRefreshHistory(actorId);
       if (action === "rollback-last") return this._onRollbackLast(actorId);
       if (action === "bulk-xp") return this._onBulkXp();
-      if (action === "bulk-mark-session") return this._onBulkMarkSession();
       if (action === "bulk-freeze") return this._onBulkFreeze();
-      if (action === "create-request") return this._onCreateRequest();
       if (action === "request-status") return this._onSetRequestStatus(el.dataset.requestId, el.dataset.requestStatus);
     });
   }
@@ -1039,15 +1035,33 @@ ${historyRows}
     const owners = game.users.filter((u) => actor.testUserPermission(u, "OWNER"));
     const playerOwners = owners.filter((u) => !u.isGM);
     const whisperTargets = playerOwners.length ? playerOwners : owners;
-    const content = `<p><strong>Level Packet Ready:</strong> ${escapeHtml(actor.name)}</p>
+    const whisperUserIds = whisperTargets.map((u) => String(u.id || "")).filter(Boolean);
+    const skillLines = (packet.skillPicks || [])
+      .map((s) => `<li><strong>${escapeHtml(s.name || s.skillId || "Skill")}</strong>: ${escapeHtml(s.description || "")}</li>`)
+      .join("");
+    const content = `<div class="wi-level-offer-chat">
+<p><strong>Level Packet Ready:</strong> ${escapeHtml(actor.name)}</p>
 <p>Type: ${escapeHtml(packet.packetType || "standard")}</p>
 <p>Delta: +${Number(packet.deltaLevels || 1)} to ${escapeHtml(packet.classId || "primary")}</p>
-<p>Skills: ${escapeHtml(JSON.stringify(packet.skillPicks || []))}</p>
-<p>The player will get an accept/reject popup.</p>`;
+<details><summary>Skill Picks</summary><ul>${skillLines || "<li>No skill picks</li>"}</ul></details>
+<div class="wi-tab-actions">
+  <button type="button" data-action="offer-accept" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Accept</button>
+  <button type="button" data-action="offer-reject" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Reject</button>
+</div>
+</div>`;
     await ChatMessage.create({
       content,
       speaker: { alias: "GM Progression Packet" },
-      whisper: whisperTargets
+      whisper: whisperUserIds,
+      flags: {
+        [MODULE_ID]: {
+          levelOfferChat: {
+            actorId: actor.id,
+            offerId: offer.offerId,
+            packet
+          }
+        }
+      }
     });
     await actor.setFlag(MODULE_ID, "levelOffer", offer);
     try {
@@ -1055,7 +1069,7 @@ ${historyRows}
         type: "level-offer-notify",
         actorId: actor.id,
         offerId: offer.offerId,
-        userIds: whisperTargets.map((u) => String(u.id || ""))
+        userIds: whisperUserIds
       });
     } catch (_err) {
       // no-op: flag update remains the primary transport

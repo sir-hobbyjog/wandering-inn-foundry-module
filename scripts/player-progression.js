@@ -209,6 +209,25 @@ async function askGmRequest(actor, requestType, payload) {
   });
 }
 
+async function acceptLevelOffer(actor, offer, packetOverride = null) {
+  const packet = packetOverride || offer?.packet || {};
+  const progression = actor.getFlag(MODULE_ID, "progression") || {};
+  const next = applyPacketToProgression(progression, packet);
+  const out = await syncProgression(actor, next);
+  await actor.update({
+    [`flags.${MODULE_ID}.progression`]: out.progression,
+    [`flags.${MODULE_ID}.levelOffer`]: null,
+    [`flags.${MODULE_ID}.dashboard.pendingChoices`]: false,
+    [`flags.${MODULE_ID}.dashboard.stagedPacket`]: null
+  });
+  return out;
+}
+
+async function rejectLevelOffer(actor, offerId, packetType = "") {
+  await askGmRequest(actor, "level_offer_rejected", { offer_id: offerId || "", packet_type: packetType || "" });
+  await actor.setFlag(MODULE_ID, "levelOffer", null);
+}
+
 async function openLevelOffer(actor, offer) {
   const key = `${game.user?.id || "u"}:${actor.id}:${offer.offerId || "offer"}`;
   if (openOfferMap.get(key)) return;
@@ -303,14 +322,7 @@ async function openLevelOffer(actor, offer) {
         label: "Accept",
         callback: async () => {
           try {
-            const next = applyPacketToProgression(progression, packet);
-            const out = await syncProgression(actor, next);
-            await actor.update({
-              [`flags.${MODULE_ID}.progression`]: out.progression,
-              [`flags.${MODULE_ID}.levelOffer`]: null,
-              [`flags.${MODULE_ID}.dashboard.pendingChoices`]: false,
-              [`flags.${MODULE_ID}.dashboard.stagedPacket`]: null
-            });
+            await acceptLevelOffer(actor, offer, packet);
             ui.notifications.info(`Accepted level offer for ${actor.name}`);
           } catch (err) {
             ui.notifications.error(String(err?.message || err));
@@ -320,8 +332,7 @@ async function openLevelOffer(actor, offer) {
       reject: {
         label: "Reject",
         callback: async () => {
-          await askGmRequest(actor, "level_offer_rejected", { offer_id: offer.offerId || "", packet_type: pType });
-          await actor.setFlag(MODULE_ID, "levelOffer", null);
+          await rejectLevelOffer(actor, offer.offerId || "", pType);
           ui.notifications.warn(`Rejected level offer for ${actor.name}; no level granted.`);
         }
       },
@@ -386,5 +397,52 @@ export function registerPlayerProgression() {
     if (offer && actor.isOwner) {
       openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] offer open failed", err));
     }
+  });
+
+  Hooks.on("renderChatMessage", (message, html) => {
+    const flag = message?.getFlag?.(MODULE_ID, "levelOfferChat");
+    if (!flag) return;
+    const actorId = String(flag.actorId || "");
+    const offerId = String(flag.offerId || "");
+    const packet = flag.packet || null;
+
+    html.on("click", "button[data-action='offer-accept']", async (ev) => {
+      const button = ev.currentTarget;
+      button.disabled = true;
+      try {
+        const actor = game.actors.get(actorId);
+        if (!actor || !actor.isOwner) {
+          ui.notifications.warn("You do not have permission to accept this packet.");
+          button.disabled = false;
+          return;
+        }
+        const live = actor.getFlag(MODULE_ID, "levelOffer");
+        const liveOffer = live && String(live.offerId || "") === offerId ? live : { offerId, packet };
+        await acceptLevelOffer(actor, liveOffer, liveOffer?.packet || packet || {});
+        ui.notifications.info(`Accepted level packet for ${actor.name}`);
+      } catch (err) {
+        ui.notifications.error(String(err?.message || err));
+        button.disabled = false;
+      }
+    });
+
+    html.on("click", "button[data-action='offer-reject']", async (ev) => {
+      const button = ev.currentTarget;
+      button.disabled = true;
+      try {
+        const actor = game.actors.get(actorId);
+        if (!actor || !actor.isOwner) {
+          ui.notifications.warn("You do not have permission to reject this packet.");
+          button.disabled = false;
+          return;
+        }
+        const pType = String(packet?.packetType || "");
+        await rejectLevelOffer(actor, offerId, pType);
+        ui.notifications.warn(`Rejected level packet for ${actor.name}`);
+      } catch (err) {
+        ui.notifications.error(String(err?.message || err));
+        button.disabled = false;
+      }
+    });
   });
 }
