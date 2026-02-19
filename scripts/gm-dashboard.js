@@ -527,11 +527,6 @@ ${historyRows}
   activateListeners(html) {
     super.activateListeners(html);
 
-    html.find("[data-action='select-actor']").on("click", (ev) => {
-      this.state.selectedActorId = ev.currentTarget.dataset.actorId;
-      this.render();
-    });
-
     html.find("#wi-roster-search").on("input", (ev) => {
       this.state.search = String(ev.currentTarget.value || "");
       this.render();
@@ -549,35 +544,44 @@ ${historyRows}
       this.render();
     });
 
-    html.find("[data-action='tab']").on("click", (ev) => {
-      this.state.activeTab = ev.currentTarget.dataset.tab || "overview";
-      this.render();
+    html.on("click", "[data-action]", async (ev) => {
+      const el = ev.currentTarget;
+      const action = String(el.dataset.action || "");
+      const actorId = String(el.dataset.actorId || "");
+      const isButton = ev.target?.closest?.("button");
+      if (isButton) ev.stopPropagation();
+
+      if (action === "select-actor") {
+        this.state.selectedActorId = actorId;
+        this.render();
+        return;
+      }
+      if (action === "tab") {
+        this.state.activeTab = el.dataset.tab || "overview";
+        this.render();
+        return;
+      }
+      if (action === "add-xp") return this._onAddXp(actorId);
+      if (action === "undo-last-xp") return this._onUndoLastXp(actorId);
+      if (action === "mark-eligible") return this._onMarkEligible(actorId);
+      if (action === "quick-level") return this._onQuickLevel(actorId);
+      if (action === "open-sheet") return this._onOpenSheet(actorId);
+      if (action === "send-packet") return this._onSendPacket(actorId);
+      if (action === "stage-levelup") return this._onStageLevelUp(actorId, html);
+      if (action === "apply-levelup") return this._onApplyLevelUp(actorId, html);
+      if (action === "add-class") return this._onAddClass(actorId);
+      if (action === "change-class") return this._onChangeClass(actorId);
+      if (action === "merge-classes") return this._onMergeClasses(actorId);
+      if (action === "lock-class") return this._onLockClass(actorId);
+      if (action === "feature-audit") return this._onFeatureAudit(actorId);
+      if (action === "refresh-history") return this._onRefreshHistory(actorId);
+      if (action === "rollback-last") return this._onRollbackLast(actorId);
+      if (action === "bulk-xp") return this._onBulkXp();
+      if (action === "bulk-mark-session") return this._onBulkMarkSession();
+      if (action === "bulk-freeze") return this._onBulkFreeze();
+      if (action === "create-request") return this._onCreateRequest();
+      if (action === "request-status") return this._onSetRequestStatus(el.dataset.requestId, el.dataset.requestStatus);
     });
-
-    html.find("button[data-action='add-xp']").on("click", async (ev) => this._onAddXp(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='undo-last-xp']").on("click", async (ev) => this._onUndoLastXp(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='mark-eligible']").on("click", async (ev) => this._onMarkEligible(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='quick-level']").on("click", async (ev) => this._onQuickLevel(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='open-sheet']").on("click", (ev) => this._onOpenSheet(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='send-packet']").on("click", async (ev) => this._onSendPacket(ev.currentTarget.dataset.actorId));
-
-    html.find("button[data-action='stage-levelup']").on("click", async (ev) => this._onStageLevelUp(ev.currentTarget.dataset.actorId, html));
-    html.find("button[data-action='apply-levelup']").on("click", async (ev) => this._onApplyLevelUp(ev.currentTarget.dataset.actorId, html));
-
-    html.find("button[data-action='add-class']").on("click", async (ev) => this._onAddClass(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='change-class']").on("click", async (ev) => this._onChangeClass(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='merge-classes']").on("click", async (ev) => this._onMergeClasses(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='lock-class']").on("click", async (ev) => this._onLockClass(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='feature-audit']").on("click", async (ev) => this._onFeatureAudit(ev.currentTarget.dataset.actorId));
-
-    html.find("button[data-action='refresh-history']").on("click", async (ev) => this._onRefreshHistory(ev.currentTarget.dataset.actorId));
-    html.find("button[data-action='rollback-last']").on("click", async (ev) => this._onRollbackLast(ev.currentTarget.dataset.actorId));
-
-    html.find("button[data-action='bulk-xp']").on("click", async () => this._onBulkXp());
-    html.find("button[data-action='bulk-mark-session']").on("click", async () => this._onBulkMarkSession());
-    html.find("button[data-action='bulk-freeze']").on("click", async () => this._onBulkFreeze());
-    html.find("button[data-action='create-request']").on("click", async () => this._onCreateRequest());
-    html.find("button[data-action='request-status']").on("click", async (ev) => this._onSetRequestStatus(ev.currentTarget.dataset.requestId, ev.currentTarget.dataset.requestStatus));
   }
 
   async _onAddXp(actorId) {
