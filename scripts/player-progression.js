@@ -65,20 +65,66 @@ function buildSkillTableRows(progression, trackers) {
   }).join("");
 }
 
+function nextLevelXp(level) {
+  const l = Math.max(1, Math.min(100, Number(level || 1)));
+  return Math.floor((l * l * 180) + (l * 320));
+}
+
+function xpCostForLevels(currentLevel, deltaLevels) {
+  let cost = 0;
+  let lvl = Number(currentLevel || 1);
+  for (let i = 0; i < Number(deltaLevels || 0); i += 1) {
+    cost += nextLevelXp(lvl);
+    lvl += 1;
+  }
+  return Math.max(0, cost);
+}
+
 function applyPacketToProgression(current, packet) {
   const next = foundry.utils.deepClone(current);
   const pType = normKey(packet.packetType || "standard");
   const delta = Number(packet.deltaLevels || 0);
 
   if (pType === "consolidation") {
-    const from = normKey(packet?.consolidation?.from);
-    const to = normKey(packet?.consolidation?.to);
-    const fromIdx = (next.classes || []).findIndex((c) => normKey(c.classId) === from);
-    const toIdx = (next.classes || []).findIndex((c) => normKey(c.classId) === to);
-    if (fromIdx < 0 || toIdx < 0) throw new Error("Invalid consolidation classes");
-    next.classes[toIdx].level = Number(next.classes[toIdx].level || 1) + Number(next.classes[fromIdx].level || 1);
-    next.classes.splice(fromIdx, 1);
+    const fromIds = Array.isArray(packet?.consolidation?.fromClassIds)
+      ? packet.consolidation.fromClassIds.map((x) => normKey(x)).filter(Boolean)
+      : [normKey(packet?.consolidation?.from)].filter(Boolean);
+    const targetClassId = normKey(packet?.consolidation?.targetClassId || packet?.consolidation?.to || "consolidated_class");
+    const targetClassName = String(packet?.consolidation?.targetClassName || packet?.consolidation?.to || "Consolidated Class");
+    if (fromIds.length < 2) throw new Error("Consolidation needs at least 2 source classes");
+    let mergedLevel = 0;
+    const remaining = [];
+    let keepPrimary = false;
+    for (const cls of next.classes || []) {
+      if (fromIds.includes(normKey(cls.classId))) {
+        mergedLevel += Number(cls.level || 1);
+        if (cls.isPrimary) keepPrimary = true;
+      } else {
+        remaining.push(cls);
+      }
+    }
+    if (mergedLevel <= 0) throw new Error("No source classes found for consolidation");
+    remaining.push({
+      classId: targetClassId,
+      name: targetClassName,
+      level: mergedLevel,
+      track: "",
+      isPrimary: keepPrimary || !remaining.some((c) => c.isPrimary),
+      isCustom: true
+    });
+    next.classes = remaining;
     if (!(next.classes || []).some((c) => c.isPrimary) && next.classes.length) next.classes[0].isPrimary = true;
+    if (Array.isArray(packet?.consolidation?.skillEdits) && packet.consolidation.skillEdits.length) {
+      const skillById = new Map((next.skills || []).map((s) => [normKey(s.skillId || s.name), s]));
+      for (const edit of packet.consolidation.skillEdits) {
+        const sid = normKey(edit.skillId || edit.name);
+        if (!sid || !skillById.has(sid)) continue;
+        const target = skillById.get(sid);
+        target.name = String(edit.name || target.name || sid);
+        target.description = String(edit.description || target.description || "");
+      }
+      next.skills = [...skillById.values()];
+    }
     return next;
   }
 
@@ -86,26 +132,30 @@ function applyPacketToProgression(current, packet) {
     const newClass = packet.newClass || {
       classId: normKey(packet.classId),
       name: packet.classId,
-      track: "",
       isPrimary: false,
       isCustom: true
     };
     next.level = Number(next.level || 1) + Math.max(0, delta || 1);
+    const xpCost = xpCostForLevels(Number(current.level || 1), Math.max(0, delta || 1));
+    next.xp = Math.max(0, Number(next.xp || 0) - xpCost);
     next.classes = Array.isArray(next.classes) ? next.classes : [];
     next.classes.push({
       classId: normKey(newClass.classId || newClass.name || "new_class"),
       name: String(newClass.name || newClass.classId || "New Class"),
       level: Math.max(1, delta || 1),
-      track: normKey(newClass.track || ""),
+      track: "",
       isPrimary: !!newClass.isPrimary,
       isCustom: true
     });
   } else {
     const addTo = normKey(packet.classId || "");
-    next.level = Number(next.level || 1) + Math.max(1, delta || 1);
+    const appliedDelta = Math.max(1, delta || 1);
+    next.level = Number(next.level || 1) + appliedDelta;
+    const xpCost = xpCostForLevels(Number(current.level || 1), appliedDelta);
+    next.xp = Math.max(0, Number(next.xp || 0) - xpCost);
     const target = (next.classes || []).find((c) => normKey(c.classId) === addTo) || (next.classes || []).find((c) => c.isPrimary) || (next.classes || [])[0];
     if (!target) throw new Error("No class found for level allocation");
-    target.level = Number(target.level || 1) + Math.max(1, delta || 1);
+    target.level = Number(target.level || 1) + appliedDelta;
   }
 
   const picks = Array.isArray(packet.skillPicks) ? packet.skillPicks : [];
@@ -315,7 +365,8 @@ export function registerPlayerProgression() {
   });
 
   Hooks.on("updateActor", (actor, changed) => {
-    const levelOfferChanged = JSON.stringify(changed || {}).includes(`"flags":{"${MODULE_ID}":{"levelOffer"`);
+    const levelOfferChanged = foundry.utils.hasProperty(changed || {}, `flags.${MODULE_ID}.levelOffer`)
+      || JSON.stringify(changed || {}).includes(`"flags":{"${MODULE_ID}":{"levelOffer"`);
     if (!levelOfferChanged) return;
     const offer = actor.getFlag(MODULE_ID, "levelOffer");
     if (offer && actor.isOwner) {

@@ -239,3 +239,43 @@
   flex-wrap: wrap;
   gap: 4px;
 }
+
+.wi-check-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(120px, 1fr));
+  gap: 6px;
+}
+
+.wi-xp-card .wi-chip-row {
+  margin: 4px 0 8px;
+}
+
+.wi-skill-draft-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.wi-skill-row {
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.wi-merge-dialog {
+  max-height: 620px;
+  overflow: auto;
+}
+
+.wi-merge-skill-row {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 6px;
+  padding: 6px;
+  margin-bottom: 8px;
+}
+
+.wi-merge-skill-row textarea,
+.wi-merge-skill-row input {
+  width: 100%;
+}

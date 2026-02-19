@@ -26,6 +26,21 @@ function nextLevelXp(level) {
   return Math.floor((l * l * 180) + (l * 320));
 }
 
+function xpCostForLevels(currentLevel, deltaLevels) {
+  let total = 0;
+  let lvl = Number(currentLevel || 1);
+  for (let i = 0; i < Number(deltaLevels || 0); i += 1) {
+    total += nextLevelXp(lvl);
+    lvl += 1;
+  }
+  return Math.max(0, total);
+}
+
+function skillIdFromName(name) {
+  const n = normKey(name || "custom_skill");
+  return n || `custom_skill_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function formatDateIso(iso) {
   if (!iso) return "-";
   const dt = new Date(iso);
@@ -41,8 +56,10 @@ function ensureDashboardMeta(actor) {
     needsReview: !!meta.needsReview,
     levelingFrozen: !!meta.levelingFrozen,
     recentActivityTags: Array.isArray(meta.recentActivityTags) ? meta.recentActivityTags : [],
+    undoneXpEventIds: Array.isArray(meta.undoneXpEventIds) ? meta.undoneXpEventIds : [],
     stagedPacket: meta.stagedPacket || null,
-    progressionSnapshots: Array.isArray(meta.progressionSnapshots) ? meta.progressionSnapshots : []
+    progressionSnapshots: Array.isArray(meta.progressionSnapshots) ? meta.progressionSnapshots : [],
+    lockedClassIds: Array.isArray(meta.lockedClassIds) ? meta.lockedClassIds : []
   };
 }
 
@@ -143,6 +160,113 @@ async function upsertProgressionMeta(actor, patch, sessionId = "") {
   });
 }
 
+async function syncProgressionPayload(actor, progression) {
+  const sessionId = await resolveSessionId();
+  return apiRequest("/foundry/actor/progression/sync", {
+    method: "POST",
+    body: {
+      world_id: game.world.id,
+      actor_id: actor.id,
+      session_id: sessionId,
+      progression
+    }
+  });
+}
+
+function applyPacketToProgression(current, packet) {
+  const next = foundry.utils.deepClone(current || {});
+  const pType = normKey(packet?.packetType || "standard");
+  const delta = Number(packet?.deltaLevels || 0);
+
+  if (pType === "consolidation") {
+    const fromIds = Array.isArray(packet?.consolidation?.fromClassIds)
+      ? packet.consolidation.fromClassIds.map((x) => normKey(x)).filter(Boolean)
+      : [normKey(packet?.consolidation?.from)].filter(Boolean);
+    const targetClassId = normKey(packet?.consolidation?.targetClassId || packet?.consolidation?.to || "consolidated_class");
+    const targetClassName = String(packet?.consolidation?.targetClassName || packet?.consolidation?.to || "Consolidated Class");
+    if (fromIds.length < 2) throw new Error("Consolidation needs at least 2 source classes");
+    let mergedLevel = 0;
+    let primarySeen = false;
+    const remaining = [];
+    for (const cls of next.classes || []) {
+      if (fromIds.includes(normKey(cls.classId))) {
+        mergedLevel += Number(cls.level || 1);
+        primarySeen = primarySeen || !!cls.isPrimary;
+      } else {
+        remaining.push(cls);
+      }
+    }
+    if (mergedLevel <= 0) throw new Error("No selected classes found for consolidation");
+    remaining.push({
+      classId: targetClassId,
+      name: targetClassName,
+      level: mergedLevel,
+      track: "",
+      isPrimary: primarySeen || !remaining.some((c) => c.isPrimary),
+      isCustom: true
+    });
+    next.classes = remaining;
+    if (!(next.classes || []).some((c) => c.isPrimary) && next.classes.length) next.classes[0].isPrimary = true;
+    if (Array.isArray(packet?.consolidation?.skillEdits)) {
+      const edits = packet.consolidation.skillEdits;
+      const byId = new Map((next.skills || []).map((s) => [normKey(s.skillId || s.name), s]));
+      for (const edit of edits) {
+        const sid = normKey(edit.skillId || edit.name);
+        if (!sid || !byId.has(sid)) continue;
+        const target = byId.get(sid);
+        target.name = String(edit.name || target.name || sid);
+        target.description = String(edit.description || target.description || "");
+      }
+      next.skills = [...byId.values()];
+    }
+    return next;
+  }
+
+  const appliedDelta = Math.max(1, delta || 1);
+  const previousLevel = Number(next.level || 1);
+  next.level = previousLevel + appliedDelta;
+  next.xp = Math.max(0, Number(next.xp || 0) - xpCostForLevels(previousLevel, appliedDelta));
+  next.classes = Array.isArray(next.classes) ? next.classes : [];
+
+  if (pType === "new_class") {
+    const newClass = packet.newClass || {};
+    next.classes.push({
+      classId: normKey(newClass.classId || newClass.name || packet.classId || "new_class"),
+      name: String(newClass.name || newClass.classId || "New Class"),
+      level: appliedDelta,
+      track: "",
+      isPrimary: !!newClass.isPrimary,
+      isCustom: true
+    });
+  } else {
+    const classId = normKey(packet.classId || "");
+    const target = next.classes.find((c) => normKey(c.classId) === classId) || next.classes.find((c) => c.isPrimary) || next.classes[0];
+    if (!target) throw new Error("No class available for level allocation");
+    target.level = Number(target.level || 1) + appliedDelta;
+  }
+
+  const picks = Array.isArray(packet.skillPicks) ? packet.skillPicks : [];
+  if (picks.length) {
+    next.skills = Array.isArray(next.skills) ? next.skills : [];
+    for (const s of picks) {
+      if (!String(s.name || "").trim()) continue;
+      next.skills.push({
+        skillId: skillIdFromName(s.skillId || s.name),
+        name: String(s.name || "").trim(),
+        source: String(s.source || "llm"),
+        tier: String(s.tier || "custom"),
+        description: String(s.description || ""),
+        tags: Array.isArray(s.tags) ? s.tags.map((t) => normKey(t)).filter(Boolean) : [],
+        cooldown: Number(s.cooldown || 0),
+        trigger: String(s.trigger || ""),
+        effect: String(s.effect || ""),
+        counterplay: String(s.counterplay || "")
+      });
+    }
+  }
+  return next;
+}
+
 async function applyLevelUp(actor, deltaLevels, classId, skillPicks) {
   const sessionId = await resolveSessionId();
   const payload = {
@@ -183,6 +307,85 @@ function collectPartyActors() {
   return game.actors.filter((a) => a.type === "character" || a.hasPlayerOwner);
 }
 
+async function promptXpEntry({ title = "Add XP", defaultAmount = 100, defaultReason = "GM input", defaultTags = ["combat"] } = {}) {
+  return new Promise((resolve) => {
+    const content = `
+<div class="wi-xp-card">
+  <div class="wi-form-row"><label>XP Amount</label><input id="wi-xp-amount" type="number" value="${Number(defaultAmount || 0)}" /></div>
+  <div class="wi-form-row"><label>Reason</label><input id="wi-xp-reason" type="text" value="${escapeHtml(defaultReason)}" /></div>
+  <div class="wi-chip-row">
+    <button type="button" data-action="xp-reason-combat">Combat</button>
+    <button type="button" data-action="xp-reason-session">Session End</button>
+  </div>
+  <div class="wi-form-row">
+    <label>Tags</label>
+    <div class="wi-check-grid">
+      <label><input type="checkbox" class="wi-xp-tag" value="combat" ${defaultTags.includes("combat") ? "checked" : ""}/> Combat</label>
+      <label><input type="checkbox" class="wi-xp-tag" value="social" ${defaultTags.includes("social") ? "checked" : ""}/> Social</label>
+      <label><input type="checkbox" class="wi-xp-tag" value="near_death" ${defaultTags.includes("near_death") ? "checked" : ""}/> Near Death</label>
+      <label><input type="checkbox" class="wi-xp-tag" value="unique" ${defaultTags.includes("unique") ? "checked" : ""}/> Unique</label>
+    </div>
+  </div>
+</div>`;
+
+    const dialog = new Dialog({
+      title,
+      content,
+      buttons: {
+        submit: {
+          label: "Apply",
+          callback: (html) => {
+            const amount = Number(html.find("#wi-xp-amount").val() || 0);
+            const reason = String(html.find("#wi-xp-reason").val() || "GM input").trim() || "GM input";
+            const tags = html
+              .find(".wi-xp-tag:checked")
+              .map((_, el) => String(el.value || "").trim())
+              .get()
+              .map(normKey)
+              .filter(Boolean);
+            resolve({ amount, reason, tags });
+          }
+        },
+        cancel: {
+          label: "Cancel",
+          callback: () => resolve(null)
+        }
+      },
+      default: "submit",
+      render: (html) => {
+        html.on("click", "button[data-action='xp-reason-combat']", () => {
+          html.find("#wi-xp-reason").val("Combat encounter");
+          html.find(".wi-xp-tag[value='combat']").prop("checked", true);
+        });
+        html.on("click", "button[data-action='xp-reason-session']", () => {
+          html.find("#wi-xp-reason").val("Session end");
+          html.find(".wi-xp-tag[value='unique']").prop("checked", true);
+        });
+      },
+      close: () => resolve(null)
+    });
+    dialog.render(true);
+  });
+}
+
+function collectChatContextForActor(actor, limit = 24) {
+  const rows = [];
+  const messages = game.messages?.contents || [];
+  for (let i = messages.length - 1; i >= 0 && rows.length < limit; i -= 1) {
+    const msg = messages[i];
+    const speakerActor = String(msg?.speaker?.actor || "");
+    const whisperIds = Array.isArray(msg?.whisper) ? msg.whisper.map((u) => String(u.id || u)) : [];
+    const actorOwners = game.users.filter((u) => actor.testUserPermission(u, "OWNER")).map((u) => String(u.id));
+    const intersectsOwners = whisperIds.some((id) => actorOwners.includes(id));
+    if (speakerActor !== actor.id && !intersectsOwners) continue;
+    const text = String(msg?.content || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const alias = msg?.speaker?.alias || msg?.user?.name || "msg";
+    rows.push(`${alias}: ${text.slice(0, 280)}`);
+  }
+  return rows;
+}
+
 class WICoreGMDashboard extends Application {
   constructor(options = {}) {
     super(options);
@@ -197,6 +400,7 @@ class WICoreGMDashboard extends Application {
       includeFrozen: true
     };
     this.historyCache = new Map();
+    this.levelDrafts = new Map();
   }
 
   static get defaultOptions() {
@@ -209,6 +413,104 @@ class WICoreGMDashboard extends Application {
       resizable: true,
       classes: ["wi-gm-dashboard-app"]
     });
+  }
+
+  _getDraft(actor, progression) {
+    const key = String(actor?.id || "");
+    if (!key) return null;
+    if (!this.levelDrafts.has(key)) {
+      const classes = Array.isArray(progression?.classes) ? progression.classes : [];
+      const primary = classes.find((c) => c.isPrimary) || classes[0] || { classId: "adventurer", name: "Adventurer" };
+      this.levelDrafts.set(key, {
+        packetType: "standard",
+        classId: String(primary.classId || "adventurer"),
+        deltaLevels: 1,
+        skillRows: [],
+        generatedAt: "",
+        contextSummary: ""
+      });
+    }
+    return this.levelDrafts.get(key);
+  }
+
+  _setDraft(actorId, patch) {
+    const key = String(actorId || "");
+    const current = this.levelDrafts.get(key) || {
+      packetType: "standard",
+      classId: "adventurer",
+      deltaLevels: 1,
+      skillRows: [],
+      generatedAt: "",
+      contextSummary: ""
+    };
+    this.levelDrafts.set(key, { ...current, ...patch });
+  }
+
+  _readSkillRowsFromUi(root) {
+    const rows = [];
+    root.find(".wi-skill-row").each((_, el) => {
+      const row = $(el);
+      const enabled = !!row.find(".wi-skill-enabled").is(":checked");
+      const name = String(row.find(".wi-skill-name").val() || "").trim();
+      const description = String(row.find(".wi-skill-description").val() || "").trim();
+      const cooldown = Number(row.find(".wi-skill-cooldown").val() || 0);
+      const source = String(row.find(".wi-skill-source").val() || "llm");
+      if (!enabled || !name) return;
+      rows.push({
+        skillId: skillIdFromName(name),
+        name,
+        description,
+        source,
+        cooldown,
+        tier: "custom",
+        tags: [source === "llm" ? "llm" : "custom"]
+      });
+    });
+    return rows;
+  }
+
+  async _generateSkillSuggestions(actor, classId, deltaLevels) {
+    const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
+    const meta = ensureDashboardMeta(actor);
+    const sessionId = await resolveSessionId();
+    const chatSnippets = collectChatContextForActor(actor, 20);
+    let combatSnippets = [];
+    try {
+      const out = await apiRequest(`/foundry/actor/combat/events?world_id=${encodeURIComponent(game.world.id)}&actor_id=${encodeURIComponent(actor.id)}&session_id=${encodeURIComponent(sessionId)}&limit=20`);
+      combatSnippets = (out.items || []).map((e) => {
+        const p = e.payload || {};
+        return `combat round=${p.round || 0} turn=${p.turn || 0} hp=${p.hp_current || 0} ac=${p.ac_current || 0} conditions=${(p.conditions || []).join(",")}`;
+      });
+    } catch (_err) {
+      combatSnippets = [];
+    }
+    const payload = {
+      world_id: game.world.id,
+      actor_id: actor.id,
+      session_id: sessionId,
+      class_id: normKey(classId),
+      level_delta: Number(deltaLevels || 1),
+      recent_activity_tags: meta.recentActivityTags || [],
+      chat_snippets: chatSnippets,
+      combat_snippets: combatSnippets,
+      existing_classes: (progression.classes || []).map((c) => String(c.classId || c.name || "")),
+      existing_skills: (progression.skills || []).map((s) => String(s.skillId || s.name || ""))
+    };
+    const out = await apiRequest("/foundry/actor/skill-suggestions", {
+      method: "POST",
+      body: payload
+    });
+    const suggestions = Array.isArray(out.suggestions) ? out.suggestions : [];
+    return {
+      suggestions: suggestions.map((s) => ({
+        enabled: true,
+        source: String(s.source || "llm"),
+        name: String(s.name || ""),
+        description: String(s.description || ""),
+        cooldown: Number(s.cooldown || 0)
+      })),
+      contextSummary: `chat:${chatSnippets.length} combat:${combatSnippets.length} tags:${(meta.recentActivityTags || []).length} model:${out.model || ""}`
+    };
   }
 
   async getData() {
@@ -239,6 +541,9 @@ class WICoreGMDashboard extends Application {
       const needed = nextLevelXp(progression.level || 1);
       const xp = Number(progression.xp || 0);
       const pct = Math.max(0, Math.min(100, Math.round((xp / Math.max(1, needed)) * 100)));
+      const pendingClassNote = localMeta?.stagedPacket?.packetType === "new_class" && localMeta?.stagedPacket?.newClass?.name
+        ? ` + pending ${String(localMeta.stagedPacket.newClass.name)}`
+        : "";
 
       return {
         actor,
@@ -246,7 +551,7 @@ class WICoreGMDashboard extends Application {
         name: actor.name,
         img: actor.img,
         level: Number(progression.level || 1),
-        classSummary: classSummary(progression.classes),
+        classSummary: `${classSummary(progression.classes)}${pendingClassNote}`,
         speciesSummary: speciesSummary(progression.species),
         status,
         xp,
@@ -274,6 +579,7 @@ class WICoreGMDashboard extends Application {
 
     let selected = filtered.find((r) => r.actorId === this.state.selectedActorId) || rows.find((r) => r.actorId === this.state.selectedActorId) || filtered[0] || rows[0] || null;
     if (selected) this.state.selectedActorId = selected.actorId;
+    const levelDraft = selected ? this._getDraft(selected.actor, selected.progression) : null;
 
     let history = [];
     let xpEvents = [];
@@ -330,6 +636,7 @@ class WICoreGMDashboard extends Application {
       playerRequests,
       sessionMarks,
       sessionId,
+      levelDraft,
       tabs: [
         { id: "overview", label: "Overview" },
         { id: "xp", label: "XP & Progress" },
@@ -375,12 +682,15 @@ class WICoreGMDashboard extends Application {
 </div>`;
     }).join("");
 
+    const pendingPacketNote = selected?.stagedPacket
+      ? `Pending packet: ${selected.stagedPacket.packetType || "standard"} ${selected.stagedPacket.newClass?.name ? `(${selected.stagedPacket.newClass.name})` : ""}`
+      : "No pending packet.";
     const overview = selected ? `
 <div class="wi-overview-grid">
   <div><label>Current Class Stack</label><p>${escapeHtml(selected.classSummary)}</p></div>
   <div><label>Species</label><p>${escapeHtml(selected.speciesSummary)}</p></div>
   <div><label>Next Unlock Preview</label><p>${escapeHtml(this._nextUnlock(selected.progression))}</p></div>
-  <div><label>Suggested Direction</label><p>${escapeHtml(this._suggestedDirection(selected))}</p></div>
+  <div><label>Suggested Direction</label><p>${escapeHtml(this._suggestedDirection(selected))}</p><p class="wi-mini">${escapeHtml(pendingPacketNote)}</p></div>
 </div>
 <div><label>Recent Activity Summary</label><p>${escapeHtml(this._activitySummary(data.xpEvents || []))}</p></div>
 ` : `<p>Select a PC from the roster.</p>`;
@@ -405,27 +715,38 @@ class WICoreGMDashboard extends Application {
   <button type="button" data-action="mark-eligible" data-actor-id="${selected.actorId}">Mark Eligible</button>
 </div>
 <table class="wi-ledger-table">
-  <thead><tr><th>Date/Session</th><th>Reason</th><th>Amount</th><th>Tags</th><th>Link</th></tr></thead>
+  <thead><tr><th>Date/Session</th><th>Reason</th><th>Amount</th><th>Tags</th><th>Ref</th></tr></thead>
   <tbody>${xpRows || `<tr><td colspan="5">No XP entries</td></tr>`}</tbody>
 </table>
 ` : "";
 
-    const classOptions = selected ? (selected.progression.classes || []).map((c) => `<option value="${escapeHtml(c.classId)}">${escapeHtml(c.name || c.classId)}</option>`).join("") : "";
+    const classOptions = selected ? (selected.progression.classes || []).map((c) => `<option value="${escapeHtml(c.classId)}" ${(data.levelDraft?.classId || "") === String(c.classId) ? "selected" : ""}>${escapeHtml(c.name || c.classId)} (Lv ${Number(c.level || 1)})</option>`).join("") : "";
+    const skillRows = (data.levelDraft?.skillRows || []).map((s, idx) => `
+<div class="wi-skill-row">
+  <label><input type="checkbox" class="wi-skill-enabled" ${s.enabled ? "checked" : ""}/> Include</label>
+  <input type="hidden" class="wi-skill-source" value="${escapeHtml(s.source || "llm")}" />
+  <div class="wi-form-row"><label>Name</label><input class="wi-skill-name" type="text" value="${escapeHtml(s.name || "")}" /></div>
+  <div class="wi-form-row"><label>Description</label><textarea class="wi-skill-description" rows="2">${escapeHtml(s.description || "")}</textarea></div>
+  <div class="wi-form-row"><label>Cooldown</label><input class="wi-skill-cooldown" type="number" min="0" value="${Number(s.cooldown || 0)}" /></div>
+</div>`).join("");
     const levelUpTab = selected ? `
-<div class="wi-form-row"><label>Delta Levels</label><input id="wi-levelup-delta" type="number" min="1" max="20" value="1" /></div>
-<div class="wi-form-row"><label>Packet Type</label><select id="wi-levelup-type"><option value="standard" selected>Standard</option><option value="new_class">New Class</option><option value="consolidation">Class Consolidation</option></select></div>
+<div class="wi-form-row"><label>Delta Levels</label><input id="wi-levelup-delta" type="number" min="1" max="20" value="${Number(data.levelDraft?.deltaLevels || 1)}" /></div>
+<div class="wi-form-row"><label>Packet Type</label><select id="wi-levelup-type"><option value="standard" ${(data.levelDraft?.packetType || "standard") === "standard" ? "selected" : ""}>Standard</option><option value="new_class" ${(data.levelDraft?.packetType || "") === "new_class" ? "selected" : ""}>New Class</option><option value="consolidation" ${(data.levelDraft?.packetType || "") === "consolidation" ? "selected" : ""}>Class Consolidation</option></select></div>
 <div class="wi-form-row"><label>Allocate To Class</label><select id="wi-levelup-class">${classOptions}</select></div>
-<div class="wi-form-row"><label>Skill Picks JSON (optional)</label><textarea id="wi-levelup-skills" rows="4" placeholder='[{"skillId":"inspire","name":"Inspire","source":"custom"}]'></textarea></div>
+<div class="wi-form-row"><label>Context</label><div>${escapeHtml(data.levelDraft?.contextSummary || "Click Generate Skills to build suggestions from activity/chat/combat context.")}</div></div>
 <div class="wi-tab-actions">
+  <button type="button" data-action="generate-skills" data-actor-id="${selected.actorId}">Generate Skills (LLM)</button>
+  <button type="button" data-action="add-custom-skill" data-actor-id="${selected.actorId}">Add Custom Skill</button>
   <button type="button" data-action="stage-levelup" data-actor-id="${selected.actorId}">Stage Packet</button>
   <button type="button" data-action="apply-levelup" data-actor-id="${selected.actorId}">Apply Level-Up</button>
 </div>
+<div class="wi-skill-draft-list">${skillRows || "<p>No skills drafted yet.</p>"}</div>
 ` : "";
 
     const classesTab = selected ? `
 <div class="wi-tab-actions">
-  <button type="button" data-action="add-class" data-actor-id="${selected.actorId}">Add Class</button>
-  <button type="button" data-action="change-class" data-actor-id="${selected.actorId}">Change Class</button>
+  <button type="button" data-action="add-class" data-actor-id="${selected.actorId}">Add Class (Packet)</button>
+  <button type="button" data-action="change-class" data-actor-id="${selected.actorId}">Rename Class</button>
   <button type="button" data-action="merge-classes" data-actor-id="${selected.actorId}">Consolidate Classes</button>
   <button type="button" data-action="lock-class" data-actor-id="${selected.actorId}">Lock Class</button>
   <button type="button" data-action="feature-audit" data-actor-id="${selected.actorId}">Feature Audit</button>
@@ -572,6 +893,8 @@ ${historyRows}
       if (action === "quick-level") return this._onQuickLevel(actorId);
       if (action === "open-sheet") return this._onOpenSheet(actorId);
       if (action === "send-packet") return this._onSendPacket(actorId);
+      if (action === "generate-skills") return this._onGenerateSkills(actorId, $root);
+      if (action === "add-custom-skill") return this._onAddCustomSkill(actorId);
       if (action === "stage-levelup") return this._onStageLevelUp(actorId, $root);
       if (action === "apply-levelup") return this._onApplyLevelUp(actorId, $root);
       if (action === "add-class") return this._onAddClass(actorId);
@@ -592,14 +915,16 @@ ${historyRows}
   async _onAddXp(actorId) {
     const actor = game.actors.get(actorId);
     if (!actor) return;
-    const amountRaw = await Dialog.prompt({ title: "Add XP", content: "<label>Amount <input id='wi-xp-amount' type='number' value='100' /></label>", callback: (h) => h.find("#wi-xp-amount").val() });
-    if (amountRaw == null) return;
-    const reason = await Dialog.prompt({ title: "XP Reason", content: "<label>Reason <input id='wi-xp-reason' type='text' value='Session reward' /></label>", callback: (h) => h.find("#wi-xp-reason").val() });
-    const tags = await Dialog.prompt({ title: "XP Tags", content: "<label>Tags (comma separated) <input id='wi-xp-tags' type='text' value='session' /></label>", callback: (h) => h.find("#wi-xp-tags").val() });
-    const link = await Dialog.prompt({ title: "Link (optional)", content: "<label>Chat/Journal/Combat Link <input id='wi-xp-link' type='text' /></label>", callback: (h) => h.find("#wi-xp-link").val() });
+    const payload = await promptXpEntry({
+      title: `Add XP: ${actor.name}`,
+      defaultAmount: 100,
+      defaultReason: "GM input",
+      defaultTags: ["combat"]
+    });
+    if (!payload) return;
 
     try {
-      await appendXp(actor, Number(amountRaw), String(reason || "XP update"), String(tags || ""), String(link || ""));
+      await appendXp(actor, Number(payload.amount || 0), String(payload.reason || "GM input"), payload.tags || [], "");
       ui.notifications.info(`Updated XP for ${actor.name}`);
       this.render();
     } catch (err) {
@@ -611,19 +936,35 @@ ${historyRows}
     const actor = game.actors.get(actorId);
     if (!actor) return;
     const sessionId = await resolveSessionId();
-    let last = null;
+    const meta = ensureDashboardMeta(actor);
+    const undone = new Set(meta.undoneXpEventIds || []);
+    let target = null;
     try {
-      const out = await apiRequest(`/foundry/actor/xp/events?world_id=${encodeURIComponent(game.world.id)}&actor_id=${encodeURIComponent(actor.id)}&session_id=${encodeURIComponent(sessionId)}&limit=1`);
-      last = (out.items || [])[0] || null;
+      const out = await apiRequest(`/foundry/actor/xp/events?world_id=${encodeURIComponent(game.world.id)}&actor_id=${encodeURIComponent(actor.id)}&session_id=${encodeURIComponent(sessionId)}&limit=120`);
+      for (const evt of out.items || []) {
+        const id = String(evt.xp_event_id || "");
+        const tags = Array.isArray(evt.tags) ? evt.tags.map((t) => normKey(t)) : [];
+        const reason = String(evt.reason || "");
+        const amount = Number(evt.amount || 0);
+        if (!id || undone.has(id)) continue;
+        if (tags.includes("undo") || reason.startsWith("Undo:")) continue;
+        if (amount <= 0) continue;
+        target = evt;
+        break;
+      }
     } catch (_err) {
-      last = null;
+      target = null;
     }
-    if (!last) {
+    if (!target) {
       ui.notifications.warn("No XP entry to undo.");
       return;
     }
     try {
-      await appendXp(actor, -Number(last.amount || 0), `Undo: ${last.reason || "XP entry"}`, ["undo"], last.linked_ref || "");
+      await appendXp(actor, -Number(target.amount || 0), `Undo: ${target.reason || "XP entry"}`, ["undo"], "");
+      await actor.setFlag(MODULE_ID, "dashboard", {
+        ...meta,
+        undoneXpEventIds: [...undone, String(target.xp_event_id || "")].slice(-300)
+      });
       ui.notifications.info(`Reverted last XP entry for ${actor.name}`);
       this.render();
     } catch (err) {
@@ -645,31 +986,28 @@ ${historyRows}
     const actor = game.actors.get(actorId);
     if (!actor) return;
     const p = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
-    const primary = (p.classes || []).find((c) => c.isPrimary) || (p.classes || [])[0];
-    if (!primary) {
+    const classes = p.classes || [];
+    if (!classes.length) {
       ui.notifications.error("No class available for level allocation.");
       return;
     }
-
-    try {
-      const out = await applyLevelUp(actor, 1, primary.classId, []);
-      const meta = ensureDashboardMeta(actor);
-      const snapshots = [...(meta.progressionSnapshots || []), {
-        at: new Date().toISOString(),
-        progression: out.progression,
-        sourceHash: out.source_hash
-      }].slice(-30);
-      await actor.update({
-        [`flags.${MODULE_ID}.progression`]: out.progression,
-        [`flags.${MODULE_ID}.dashboard`]: { ...meta, pendingChoices: false, eligibleOverride: false, progressionSnapshots: snapshots }
-      });
-      await upsertProgressionMeta(actor, { pendingChoices: false }, await resolveSessionId());
-      this.historyCache.delete(`${game.world.id}::${actor.id}`);
-      ui.notifications.info(`${actor.name} leveled to ${out.progression.level}`);
-      this.render();
-    } catch (err) {
-      ui.notifications.error(String(err.message || err));
-    }
+    const options = classes.map((c) => `<option value="${escapeHtml(c.classId)}">${escapeHtml(c.name || c.classId)} (Lv ${Number(c.level || 1)})</option>`).join("");
+    const classId = await Dialog.prompt({
+      title: `Level Up Class: ${actor.name}`,
+      content: `<label>Apply level to class<select id="wi-quick-class">${options}</select></label>`,
+      callback: (h) => h.find("#wi-quick-class").val()
+    });
+    if (!classId) return;
+    this._setDraft(actor.id, {
+      classId: String(classId),
+      deltaLevels: 1,
+      packetType: "standard"
+    });
+    await this._onGenerateSkills(actor.id, this.element);
+    this.state.selectedActorId = actor.id;
+    this.state.activeTab = "levelup";
+    ui.notifications.info(`Prepared level-up draft for ${actor.name}. Review skills and stage packet.`);
+    this.render();
   }
 
   _onOpenSheet(actorId) {
@@ -693,6 +1031,8 @@ ${historyRows}
       packet
     };
     const owners = game.users.filter((u) => actor.testUserPermission(u, "OWNER"));
+    const playerOwners = owners.filter((u) => !u.isGM);
+    const whisperTargets = playerOwners.length ? playerOwners : owners;
     const content = `<p><strong>Level Packet Ready:</strong> ${escapeHtml(actor.name)}</p>
 <p>Type: ${escapeHtml(packet.packetType || "standard")}</p>
 <p>Delta: +${Number(packet.deltaLevels || 1)} to ${escapeHtml(packet.classId || "primary")}</p>
@@ -701,13 +1041,16 @@ ${historyRows}
     await ChatMessage.create({
       content,
       speaker: { alias: "GM Progression Packet" },
-      whisper: [...new Set([...ChatMessage.getWhisperRecipients("GM"), ...owners])]
+      whisper: whisperTargets
     });
     await actor.setFlag(MODULE_ID, "levelOffer", offer);
     await actor.setFlag(MODULE_ID, "dashboard", {
       ...meta,
       stagedPacket: { ...packet, sentAt: new Date().toISOString() }
     });
+    if (!playerOwners.length) {
+      ui.notifications.warn(`No non-GM owner found for ${actor.name}. Packet was sent to current owners only.`);
+    }
     ui.notifications.info(`Sent staged packet for ${actor.name}`);
     this.render();
   }
@@ -718,16 +1061,28 @@ ${historyRows}
     const deltaLevels = Number(html.find("#wi-levelup-delta").val() || 1);
     const packetType = String(html.find("#wi-levelup-type").val() || "standard");
     const classId = String(html.find("#wi-levelup-class").val() || "");
-    const rawSkills = String(html.find("#wi-levelup-skills").val() || "").trim();
-    let skillPicks = [];
-    if (rawSkills) {
-      try {
-        skillPicks = JSON.parse(rawSkills);
-      } catch (_err) {
-        ui.notifications.error("Skill picks JSON is invalid.");
-        return;
-      }
+    if (normKey(packetType) === "standard" && !String(classId || "").trim()) {
+      ui.notifications.warn("Choose a class for level allocation.");
+      return;
     }
+    const skillPicks = this._readSkillRowsFromUi(html);
+    const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
+    this._setDraft(actor.id, {
+      ...draft,
+      classId: normKey(classId),
+      deltaLevels: Number(deltaLevels || 1),
+      packetType: normKey(packetType),
+      skillRows: html.find(".wi-skill-row").map((_, el) => {
+        const row = $(el);
+        return {
+          enabled: !!row.find(".wi-skill-enabled").is(":checked"),
+          source: String(row.find(".wi-skill-source").val() || "llm"),
+          name: String(row.find(".wi-skill-name").val() || ""),
+          description: String(row.find(".wi-skill-description").val() || ""),
+          cooldown: Number(row.find(".wi-skill-cooldown").val() || 0)
+        };
+      }).get()
+    });
 
     const meta = ensureDashboardMeta(actor);
     const sessionId = await resolveSessionId();
@@ -752,18 +1107,29 @@ ${historyRows}
     const actor = game.actors.get(actorId);
     if (!actor) return;
     const meta = ensureDashboardMeta(actor);
-    let deltaLevels = Number(html.find("#wi-levelup-delta").val() || 1);
-    let classId = String(html.find("#wi-levelup-class").val() || "");
-    let skillPicks = [];
-
+    const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
+    const deltaLevels = Number(html.find("#wi-levelup-delta").val() || draft?.deltaLevels || 1);
+    const classId = String(html.find("#wi-levelup-class").val() || draft?.classId || "");
+    const packetType = String(html.find("#wi-levelup-type").val() || draft?.packetType || "standard");
+    if (normKey(packetType) === "standard" && !String(classId || "").trim()) {
+      ui.notifications.warn("Choose a class for level allocation.");
+      return;
+    }
+    const skillPicks = this._readSkillRowsFromUi(html);
+    let packet = {
+      packetType: normKey(packetType),
+      deltaLevels: Number(deltaLevels || 1),
+      classId: normKey(classId),
+      skillPicks
+    };
     if (meta.stagedPacket) {
-      deltaLevels = Number(meta.stagedPacket.deltaLevels || deltaLevels);
-      classId = String(meta.stagedPacket.classId || classId);
-      skillPicks = Array.isArray(meta.stagedPacket.skillPicks) ? meta.stagedPacket.skillPicks : [];
+      packet = { ...packet, ...meta.stagedPacket, skillPicks };
     }
 
     try {
-      const out = await applyLevelUp(actor, deltaLevels, classId, skillPicks);
+      const current = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
+      const next = applyPacketToProgression(current, packet);
+      const out = await syncProgressionPayload(actor, next);
       const snapshots = [...(meta.progressionSnapshots || []), {
         at: new Date().toISOString(),
         progression: out.progression,
@@ -780,6 +1146,7 @@ ${historyRows}
           progressionSnapshots: snapshots
         }
       });
+      this.levelDrafts.delete(actor.id);
       await upsertProgressionMeta(actor, { pendingChoices: false }, await resolveSessionId());
       this.historyCache.delete(`${game.world.id}::${actor.id}`);
       ui.notifications.info(`Applied level-up for ${actor.name}`);
@@ -789,14 +1156,56 @@ ${historyRows}
     }
   }
 
+  async _onGenerateSkills(actorId, htmlRoot) {
+    const actor = game.actors.get(actorId);
+    if (!actor) return;
+    const classId = String(htmlRoot.find("#wi-levelup-class").val() || this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor))?.classId || "");
+    const deltaLevels = Number(htmlRoot.find("#wi-levelup-delta").val() || 1);
+    try {
+      const out = await this._generateSkillSuggestions(actor, classId, deltaLevels);
+      const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
+      this._setDraft(actor.id, {
+        ...draft,
+        classId: normKey(classId),
+        deltaLevels,
+        skillRows: out.suggestions,
+        generatedAt: new Date().toISOString(),
+        contextSummary: out.contextSummary
+      });
+      this.render();
+    } catch (err) {
+      ui.notifications.error(`Skill generation failed: ${String(err.message || err)}`);
+    }
+  }
+
+  async _onAddCustomSkill(actorId) {
+    const actor = game.actors.get(actorId);
+    if (!actor) return;
+    const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
+    this._setDraft(actor.id, {
+      ...draft,
+      skillRows: [
+        ...(draft?.skillRows || []),
+        {
+          enabled: true,
+          source: "custom",
+          name: "",
+          description: "",
+          cooldown: 0
+        }
+      ]
+    });
+    this.render();
+  }
+
   async _onAddClass(actorId) {
     const actor = game.actors.get(actorId);
     if (!actor) return;
     const className = await Dialog.prompt({ title: "Add Class", content: "<label>Class Name <input id='wi-class-name' type='text' value='Runner' /></label>", callback: (h) => h.find("#wi-class-name").val() });
     if (!className) return;
-    const track = await Dialog.prompt({ title: "Class Track", content: "<label>Track <input id='wi-class-track' type='text' value='support' /></label>", callback: (h) => h.find("#wi-class-track").val() }) || "";
 
     const meta = ensureDashboardMeta(actor);
+    const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
     await actor.setFlag(MODULE_ID, "dashboard", {
       ...meta,
       pendingChoices: true,
@@ -804,17 +1213,23 @@ ${historyRows}
         packetType: "new_class",
         deltaLevels: 1,
         classId: normKey(className),
-        skillPicks: [],
+        skillPicks: this._readSkillRowsFromUi(this.element),
         newClass: {
           classId: normKey(className),
           name: String(className),
-          track: normKey(track),
+          track: "",
           isPrimary: false,
           isCustom: true
         },
         stagedAt: new Date().toISOString(),
         stagedBy: game.user?.id || ""
       }
+    });
+    this._setDraft(actor.id, {
+      ...draft,
+      packetType: "new_class",
+      classId: normKey(className),
+      deltaLevels: 1
     });
     await upsertProgressionMeta(actor, { pendingChoices: true }, await resolveSessionId());
     ui.notifications.info(`Staged NEW CLASS offer for ${actor.name}. Send packet to player.`);
@@ -828,15 +1243,16 @@ ${historyRows}
     const list = (p.classes || []).map((c) => c.classId).join(", ");
     const target = await Dialog.prompt({ title: "Change Class", content: `<label>Class ID (${escapeHtml(list)}) <input id='wi-change-class-id' type='text' /></label>`, callback: (h) => h.find("#wi-change-class-id").val() });
     if (!target) return;
-    const newTrack = await Dialog.prompt({ title: "New Track", content: "<label>Track <input id='wi-change-track' type='text' value='warrior' /></label>", callback: (h) => h.find("#wi-change-track").val() });
+    const newName = await Dialog.prompt({ title: "Rename Class", content: "<label>New Name <input id='wi-change-class-name' type='text' value='' /></label>", callback: (h) => h.find("#wi-change-class-name").val() });
+    if (!newName) return;
 
     try {
       await mutateProgression(actor, (prog) => {
         const cls = (prog.classes || []).find((c) => normKey(c.classId) === normKey(target));
         if (!cls) throw new Error("Class not found");
-        cls.track = normKey(newTrack);
+        cls.name = String(newName);
       });
-      ui.notifications.info(`Updated class ${target} for ${actor.name}`);
+      ui.notifications.info(`Renamed class ${target} for ${actor.name}`);
       this.render();
     } catch (err) {
       ui.notifications.error(String(err.message || err));
@@ -847,10 +1263,85 @@ ${historyRows}
     const actor = game.actors.get(actorId);
     if (!actor) return;
     const p = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
-    const names = (p.classes || []).map((c) => c.classId).join(", ");
-    const from = await Dialog.prompt({ title: "Merge Classes", content: `<label>From class (${escapeHtml(names)}) <input id='wi-merge-from' type='text' /></label>`, callback: (h) => h.find("#wi-merge-from").val() });
-    const to = await Dialog.prompt({ title: "Merge Classes", content: `<label>To class (${escapeHtml(names)}) <input id='wi-merge-to' type='text' /></label>`, callback: (h) => h.find("#wi-merge-to").val() });
-    if (!from || !to || normKey(from) === normKey(to)) return;
+    const classRows = (p.classes || [])
+      .map((c) => `<label><input type="checkbox" class="wi-merge-class" value="${escapeHtml(c.classId)}" /> ${escapeHtml(c.name || c.classId)} (Lv ${Number(c.level || 1)})</label>`)
+      .join("<br/>");
+    const skillRows = (p.skills || [])
+      .map((s) => `
+<div class="wi-merge-skill-row" data-skill-id="${escapeHtml(s.skillId || s.name)}">
+  <label>${escapeHtml(s.name || s.skillId)}</label>
+  <input type="text" class="wi-merge-skill-name" value="${escapeHtml(s.name || s.skillId || "")}" />
+  <textarea class="wi-merge-skill-desc" rows="2">${escapeHtml(s.description || "")}</textarea>
+</div>`)
+      .join("");
+    const content = `
+<div class="wi-merge-dialog">
+  <h4>Select 2+ Classes</h4>
+  <div>${classRows || "No classes"}</div>
+  <div class="wi-form-row"><label>Consolidated Class Name</label><input id="wi-merge-name" type="text" value="Hybrid Class" /></div>
+  <div class="wi-form-row"><label>Notes (optional)</label><input id="wi-merge-notes" type="text" value="" /></div>
+  <div class="wi-tab-actions">
+    <button type="button" data-action="generate-merge-name">Generate Name (LLM)</button>
+  </div>
+  <h4>Skill Consolidation / Edits</h4>
+  <div>${skillRows || "<p>No skills found.</p>"}</div>
+</div>`;
+
+    const run = await new Promise((resolve) => {
+      const dialog = new Dialog({
+        title: `Consolidate Classes: ${actor.name}`,
+        content,
+        buttons: {
+          stage: {
+            label: "Stage Consolidation",
+            callback: (html) => {
+              const selectedIds = html.find(".wi-merge-class:checked").map((_, el) => String(el.value || "")).get().map(normKey).filter(Boolean);
+              const targetName = String(html.find("#wi-merge-name").val() || "").trim();
+              const notes = String(html.find("#wi-merge-notes").val() || "").trim();
+              const skillEdits = html.find(".wi-merge-skill-row").map((_, el) => {
+                const row = $(el);
+                return {
+                  skillId: String(row.data("skillId") || ""),
+                  name: String(row.find(".wi-merge-skill-name").val() || ""),
+                  description: String(row.find(".wi-merge-skill-desc").val() || "")
+                };
+              }).get();
+              resolve({ selectedIds, targetName, notes, skillEdits });
+            }
+          },
+          cancel: { label: "Cancel", callback: () => resolve(null) }
+        },
+        default: "stage",
+        render: (html) => {
+          html.on("click", "button[data-action='generate-merge-name']", async () => {
+            const names = html.find(".wi-merge-class:checked").map((_, el) => String(el.value || "")).get();
+            const note = String(html.find("#wi-merge-notes").val() || "");
+            const skillNames = (p.skills || []).map((s) => String(s.name || s.skillId || ""));
+            try {
+              const out = await apiRequest("/foundry/actor/class-merge-suggest", {
+                method: "POST",
+                body: { class_names: names, skill_names: skillNames, notes: note }
+              });
+              html.find("#wi-merge-name").val(String(out.name || "Hybrid Class"));
+            } catch (err) {
+              ui.notifications.error(`Name suggestion failed: ${String(err.message || err)}`);
+            }
+          });
+        },
+        close: () => resolve(null)
+      });
+      dialog.render(true);
+    });
+
+    if (!run) return;
+    if ((run.selectedIds || []).length < 2) {
+      ui.notifications.warn("Select at least 2 classes to consolidate.");
+      return;
+    }
+    if (!String(run.targetName || "").trim()) {
+      ui.notifications.warn("Consolidated class name is required.");
+      return;
+    }
 
     const meta = ensureDashboardMeta(actor);
     await actor.setFlag(MODULE_ID, "dashboard", {
@@ -859,12 +1350,23 @@ ${historyRows}
       stagedPacket: {
         packetType: "consolidation",
         deltaLevels: 0,
-        classId: normKey(to),
+        classId: normKey(run.targetName),
         skillPicks: [],
-        consolidation: { from: normKey(from), to: normKey(to) },
+        consolidation: {
+          fromClassIds: run.selectedIds,
+          targetClassId: normKey(run.targetName),
+          targetClassName: String(run.targetName),
+          notes: String(run.notes || ""),
+          skillEdits: run.skillEdits || []
+        },
         stagedAt: new Date().toISOString(),
         stagedBy: game.user?.id || ""
       }
+    });
+    this._setDraft(actor.id, {
+      packetType: "consolidation",
+      classId: normKey(run.targetName),
+      deltaLevels: 0
     });
     await upsertProgressionMeta(actor, { pendingChoices: true }, await resolveSessionId());
     ui.notifications.info(`Staged CONSOLIDATION offer for ${actor.name}. Send packet to player.`);
@@ -935,14 +1437,17 @@ ${historyRows}
   }
 
   async _onBulkXp() {
-    const amountRaw = await Dialog.prompt({ title: "Party XP", content: "<label>XP Amount <input id='wi-bulk-xp' type='number' value='100' /></label>", callback: (h) => h.find("#wi-bulk-xp").val() });
-    if (amountRaw == null) return;
-    const reason = await Dialog.prompt({ title: "Party XP Reason", content: "<label>Reason <input id='wi-bulk-xp-reason' type='text' value='Session complete' /></label>", callback: (h) => h.find("#wi-bulk-xp-reason").val() });
-    const tags = await Dialog.prompt({ title: "Party XP Tags", content: "<label>Tags <input id='wi-bulk-xp-tags' type='text' value='session' /></label>", callback: (h) => h.find("#wi-bulk-xp-tags").val() });
+    const payload = await promptXpEntry({
+      title: "Party XP",
+      defaultAmount: 100,
+      defaultReason: "GM input",
+      defaultTags: ["unique"]
+    });
+    if (!payload) return;
     const actors = collectPartyActors();
     for (const actor of actors) {
       try {
-        await appendXp(actor, Number(amountRaw), String(reason || "Party XP"), String(tags || ""), "");
+        await appendXp(actor, Number(payload.amount || 0), String(payload.reason || "Party XP"), payload.tags || [], "");
       } catch (err) {
         console.error("[wi-core-foundry] bulk xp failed", actor.name, err);
       }
