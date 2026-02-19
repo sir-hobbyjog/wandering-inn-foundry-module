@@ -494,7 +494,14 @@ class WICoreGMDashboard extends Application {
       chat_snippets: chatSnippets,
       combat_snippets: combatSnippets,
       existing_classes: (progression.classes || []).map((c) => String(c.classId || c.name || "")),
-      existing_skills: (progression.skills || []).map((s) => String(s.skillId || s.name || ""))
+      existing_class_levels: (progression.classes || []).map((c) => ({
+        class_id: String(c.classId || ""),
+        class_name: String(c.name || c.classId || ""),
+        level: Number(c.level || 1)
+      })),
+      existing_skills: (progression.skills || []).map((s) => String(s.skillId || s.name || "")),
+      species_primary: String(progression.species?.primary || ""),
+      actor_name: String(actor.name || "")
     };
     const out = await apiRequest("/foundry/actor/skill-suggestions", {
       method: "POST",
@@ -725,9 +732,11 @@ class WICoreGMDashboard extends Application {
 <div class="wi-skill-row">
   <label><input type="checkbox" class="wi-skill-enabled" ${s.enabled ? "checked" : ""}/> Include</label>
   <input type="hidden" class="wi-skill-source" value="${escapeHtml(s.source || "llm")}" />
+  <input type="hidden" class="wi-skill-index" value="${idx}" />
   <div class="wi-form-row"><label>Name</label><input class="wi-skill-name" type="text" value="${escapeHtml(s.name || "")}" /></div>
   <div class="wi-form-row"><label>Description</label><textarea class="wi-skill-description" rows="2">${escapeHtml(s.description || "")}</textarea></div>
   <div class="wi-form-row"><label>Cooldown</label><input class="wi-skill-cooldown" type="number" min="0" value="${Number(s.cooldown || 0)}" /></div>
+  <div class="wi-tab-actions"><button type="button" data-action="polish-skill" data-actor-id="${selected.actorId}" data-skill-index="${idx}">LLM Polish</button></div>
 </div>`).join("");
     const levelUpTab = selected ? `
 <div class="wi-form-row"><label>Delta Levels</label><input id="wi-levelup-delta" type="number" min="1" max="20" value="${Number(data.levelDraft?.deltaLevels || 1)}" /></div>
@@ -748,8 +757,6 @@ class WICoreGMDashboard extends Application {
   <button type="button" data-action="add-class" data-actor-id="${selected.actorId}">Add Class (Packet)</button>
   <button type="button" data-action="change-class" data-actor-id="${selected.actorId}">Rename Class</button>
   <button type="button" data-action="merge-classes" data-actor-id="${selected.actorId}">Consolidate Classes</button>
-  <button type="button" data-action="lock-class" data-actor-id="${selected.actorId}">Lock Class</button>
-  <button type="button" data-action="feature-audit" data-actor-id="${selected.actorId}">Feature Audit</button>
 </div>
 <div class="wi-class-list">${(selected.progression.classes || []).map((c) => `<div><strong>${escapeHtml(c.name || c.classId)}</strong> Lv ${Number(c.level || 1)} ${c.isPrimary ? "(Primary)" : ""}</div>`).join("") || "No classes"}</div>
 ` : "";
@@ -900,8 +907,7 @@ ${historyRows}
       if (action === "add-class") return this._onAddClass(actorId);
       if (action === "change-class") return this._onChangeClass(actorId);
       if (action === "merge-classes") return this._onMergeClasses(actorId);
-      if (action === "lock-class") return this._onLockClass(actorId);
-      if (action === "feature-audit") return this._onFeatureAudit(actorId);
+      if (action === "polish-skill") return this._onPolishSkill(actorId, Number(el.dataset.skillIndex || -1));
       if (action === "refresh-history") return this._onRefreshHistory(actorId);
       if (action === "rollback-last") return this._onRollbackLast(actorId);
       if (action === "bulk-xp") return this._onBulkXp();
@@ -1044,6 +1050,16 @@ ${historyRows}
       whisper: whisperTargets
     });
     await actor.setFlag(MODULE_ID, "levelOffer", offer);
+    try {
+      game.socket?.emit(`module.${MODULE_ID}`, {
+        type: "level-offer-notify",
+        actorId: actor.id,
+        offerId: offer.offerId,
+        userIds: whisperTargets.map((u) => String(u.id || ""))
+      });
+    } catch (_err) {
+      // no-op: flag update remains the primary transport
+    }
     await actor.setFlag(MODULE_ID, "dashboard", {
       ...meta,
       stagedPacket: { ...packet, sentAt: new Date().toISOString() }
@@ -1127,29 +1143,18 @@ ${historyRows}
     }
 
     try {
-      const current = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
-      const next = applyPacketToProgression(current, packet);
-      const out = await syncProgressionPayload(actor, next);
-      const snapshots = [...(meta.progressionSnapshots || []), {
-        at: new Date().toISOString(),
-        progression: out.progression,
-        sourceHash: out.source_hash
-      }].slice(-30);
-
-      await actor.update({
-        [`flags.${MODULE_ID}.progression`]: out.progression,
-        [`flags.${MODULE_ID}.dashboard`]: {
-          ...meta,
-          stagedPacket: null,
-          pendingChoices: false,
-          eligibleOverride: false,
-          progressionSnapshots: snapshots
-        }
+      await actor.setFlag(MODULE_ID, "dashboard", {
+        ...meta,
+        stagedPacket: {
+          ...packet,
+          stagedAt: new Date().toISOString(),
+          stagedBy: game.user?.id || ""
+        },
+        pendingChoices: true
       });
-      this.levelDrafts.delete(actor.id);
-      await upsertProgressionMeta(actor, { pendingChoices: false }, await resolveSessionId());
-      this.historyCache.delete(`${game.world.id}::${actor.id}`);
-      ui.notifications.info(`Applied level-up for ${actor.name}`);
+      await upsertProgressionMeta(actor, { pendingChoices: true }, await resolveSessionId());
+      await this._onSendPacket(actorId);
+      ui.notifications.info(`Packet sent to ${actor.name}'s player for acceptance.`);
       this.render();
     } catch (err) {
       ui.notifications.error(String(err.message || err));
@@ -1181,6 +1186,47 @@ ${historyRows}
   async _onAddCustomSkill(actorId) {
     const actor = game.actors.get(actorId);
     if (!actor) return;
+    const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
+    const name = await Dialog.prompt({
+      title: `Custom Skill Name: ${actor.name}`,
+      content: "<label>Skill Name <input id='wi-custom-skill-name' type='text' value='' /></label>",
+      callback: (h) => h.find("#wi-custom-skill-name").val()
+    });
+    if (!name) return;
+    const notes = await Dialog.prompt({
+      title: "Custom Skill Notes (optional)",
+      content: "<label>Notes <input id='wi-custom-skill-notes' type='text' value='' /></label>",
+      callback: (h) => h.find("#wi-custom-skill-notes").val()
+    }) || "";
+    let polished = {
+      name: String(name),
+      description: "",
+      cooldown: 0
+    };
+    try {
+      const out = await apiRequest("/foundry/actor/skill-polish", {
+        method: "POST",
+        body: {
+          skill_name: String(name),
+          actor_name: String(actor.name || ""),
+          species_primary: String(progression.species?.primary || ""),
+          class_levels: (progression.classes || []).map((c) => ({ class_id: c.classId, class_name: c.name, level: c.level })),
+          notes: String(notes || ""),
+          existing_skill_names: (progression.skills || []).map((s) => String(s.name || s.skillId || ""))
+        }
+      });
+      polished = {
+        name: String(out.name || name),
+        description: String(out.description || ""),
+        cooldown: Number(out.cooldown || 0)
+      };
+    } catch (_err) {
+      polished = {
+        name: String(name),
+        description: String(notes || ""),
+        cooldown: 0
+      };
+    }
     const draft = this._getDraft(actor, actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor));
     this._setDraft(actor.id, {
       ...draft,
@@ -1189,13 +1235,51 @@ ${historyRows}
         {
           enabled: true,
           source: "custom",
-          name: "",
-          description: "",
-          cooldown: 0
+          name: polished.name,
+          description: polished.description,
+          cooldown: polished.cooldown
         }
       ]
     });
     this.render();
+  }
+
+  async _onPolishSkill(actorId, skillIndex) {
+    const actor = game.actors.get(actorId);
+    if (!actor) return;
+    if (Number(skillIndex) < 0) return;
+    const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
+    const draft = this._getDraft(actor, progression);
+    const row = (draft?.skillRows || [])[Number(skillIndex)];
+    if (!row) return;
+    try {
+      const out = await apiRequest("/foundry/actor/skill-polish", {
+        method: "POST",
+        body: {
+          skill_name: String(row.name || "").trim(),
+          actor_name: String(actor.name || ""),
+          species_primary: String(progression.species?.primary || ""),
+          class_levels: (progression.classes || []).map((c) => ({ class_id: c.classId, class_name: c.name, level: c.level })),
+          notes: String(row.description || ""),
+          existing_skill_names: (progression.skills || []).map((s) => String(s.name || s.skillId || ""))
+        }
+      });
+      const nextRows = [...(draft?.skillRows || [])];
+      nextRows[Number(skillIndex)] = {
+        ...nextRows[Number(skillIndex)],
+        name: String(out.name || nextRows[Number(skillIndex)].name || ""),
+        description: String(out.description || nextRows[Number(skillIndex)].description || ""),
+        cooldown: Number(out.cooldown || nextRows[Number(skillIndex)].cooldown || 0),
+        source: "llm"
+      };
+      this._setDraft(actor.id, {
+        ...draft,
+        skillRows: nextRows
+      });
+      this.render();
+    } catch (err) {
+      ui.notifications.error(`Skill polish failed: ${String(err.message || err)}`);
+    }
   }
 
   async _onAddClass(actorId) {
@@ -1320,7 +1404,14 @@ ${historyRows}
             try {
               const out = await apiRequest("/foundry/actor/class-merge-suggest", {
                 method: "POST",
-                body: { class_names: names, skill_names: skillNames, notes: note }
+                body: {
+                  class_names: names,
+                  class_levels: (p.classes || []).map((c) => ({ class_id: c.classId, class_name: c.name, level: c.level })),
+                  species_primary: String(p.species?.primary || ""),
+                  actor_name: String(actor.name || ""),
+                  skill_names: skillNames,
+                  notes: note
+                }
               });
               html.find("#wi-merge-name").val(String(out.name || "Hybrid Class"));
             } catch (err) {

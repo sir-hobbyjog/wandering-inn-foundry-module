@@ -362,6 +362,20 @@ async function scanAndOpenOffers() {
 export function registerPlayerProgression() {
   Hooks.once("ready", () => {
     scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] offer scan failed", err));
+    game.socket?.on(`module.${MODULE_ID}`, (payload) => {
+      if (!payload || payload.type !== "level-offer-notify") return;
+      const userIds = Array.isArray(payload.userIds) ? payload.userIds.map((x) => String(x)) : [];
+      const me = String(game.user?.id || "");
+      if (userIds.length && !userIds.includes(me)) return;
+      const actor = game.actors.get(String(payload.actorId || ""));
+      if (!actor || !actor.isOwner) return;
+      const offer = actor.getFlag(MODULE_ID, "levelOffer");
+      if (offer && offer.packet) {
+        openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] socket offer open failed", err));
+      } else {
+        scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] socket scan failed", err));
+      }
+    });
   });
 
   Hooks.on("updateActor", (actor, changed) => {
