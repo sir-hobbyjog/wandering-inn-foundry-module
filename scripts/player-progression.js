@@ -3,6 +3,7 @@ import { resolveSessionId } from "./session.js";
 
 const MODULE_ID = "wi-core-foundry";
 const openOfferMap = new Map();
+const pendingOfferActionRequests = new Map();
 
 function normKey(v) {
   return String(v || "").trim().toLowerCase().replace(/\s+/g, "_");
@@ -56,11 +57,6 @@ function buildSkillTableRows(progression, trackers) {
   <td>${Number(t.cooldownRemaining || 0)} / ${Number(t.cooldownBase || 0)}</td>
   <td>${Number(t.usesRemaining || 0)} / ${Number(t.usesMax || 0)}</td>
   <td>${escapeHtml(t.per || "scene")}</td>
-  <td class="wi-skill-actions">
-    <button type="button" data-action="skill-use" data-skill-id="${escapeHtml(sid)}">Use</button>
-    <button type="button" data-action="skill-recharge" data-skill-id="${escapeHtml(sid)}">Recharge</button>
-    <button type="button" data-action="skill-gm-refresh" data-skill-id="${escapeHtml(sid)}">Ask GM Refresh</button>
-  </td>
 </tr>`;
   }).join("");
 }
@@ -110,6 +106,54 @@ function offerTargetsUser(offer, userId) {
   return targets.includes(String(userId || ""));
 }
 
+function primaryActiveGmId() {
+  const gms = game.users
+    .filter((u) => u.isGM && u.active)
+    .sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")));
+  return String(gms[0]?.id || "");
+}
+
+function fallbackProgressionFromPacket(packet) {
+  const classId = normKey(packet?.classId || "adventurer");
+  const className = String(packet?.classId || "Adventurer");
+  return {
+    schemaVersion: 1,
+    level: 1,
+    xp: 0,
+    species: { primary: "human", subtypes: [], traits: [] },
+    classes: [{ classId, name: className, level: 1, track: "", isPrimary: true, isCustom: true }],
+    skills: [],
+    resistances: {},
+  };
+}
+
+function offerDisplayModel(packet) {
+  const pType = normKey(packet?.packetType || "standard");
+  if (pType === "new_class") {
+    return {
+      title: "NEW CLASS OPTION",
+      subtitle: "Your character has unlocked a new class path.",
+      detail: `Class: ${String(packet?.newClass?.name || packet?.classId || "New Class")}`,
+      accent: "newclass",
+    };
+  }
+  if (pType === "consolidation") {
+    const target = String(packet?.consolidation?.targetClassName || packet?.classId || "Consolidated Class");
+    return {
+      title: "CLASS EVOLUTION",
+      subtitle: "You have a class consolidation option.",
+      detail: `Result: ${target}`,
+      accent: "evolution",
+    };
+  }
+  return {
+    title: "LEVEL UP",
+    subtitle: "Your character can level now.",
+    detail: `+${Number(packet?.deltaLevels || 1)} level${Number(packet?.deltaLevels || 1) === 1 ? "" : "s"}`,
+    accent: "levelup",
+  };
+}
+
 async function markOfferDelivered(actor, offer, userId) {
   if (!actor?.isOwner && !game.user?.isGM) return false;
   const all = getOfferList(actor);
@@ -129,6 +173,7 @@ async function markOfferDelivered(actor, offer, userId) {
 
 async function requestOfferActionFromGm(actorId, offerId, packet, action) {
   const sid = await resolveSessionId();
+  const requestId = foundry.utils.randomID();
   try {
     await apiRequest("/foundry/actor/request", {
       method: "POST",
@@ -148,18 +193,43 @@ async function requestOfferActionFromGm(actorId, offerId, packet, action) {
   } catch (_err) {
     // best effort
   }
-  try {
-    game.socket?.emit(`module.${MODULE_ID}`, {
-      type: "level-offer-action-request",
-      actorId: String(actorId || ""),
-      offerId: String(offerId || ""),
-      action: action === "accept" ? "accept" : "reject",
-      userId: String(game.user?.id || ""),
-      userName: String(game.user?.name || ""),
-    });
-  } catch (_err) {
-    // no-op
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      pendingOfferActionRequests.delete(requestId);
+      reject(new Error("GM did not acknowledge packet action in time."));
+    }, 12000);
+    pendingOfferActionRequests.set(requestId, { resolve, reject, timeoutId });
+    try {
+      game.socket?.emit(`module.${MODULE_ID}`, {
+        type: "level-offer-action-request",
+        requestId,
+        actorId: String(actorId || ""),
+        offerId: String(offerId || ""),
+        action: action === "accept" ? "accept" : "reject",
+        userId: String(game.user?.id || ""),
+        userName: String(game.user?.name || ""),
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      pendingOfferActionRequests.delete(requestId);
+      reject(err);
+    }
+  });
+}
+
+function resolvePendingActionRequest(payload) {
+  const requestId = String(payload?.requestId || "");
+  if (!requestId) return false;
+  const entry = pendingOfferActionRequests.get(requestId);
+  if (!entry) return false;
+  clearTimeout(entry.timeoutId);
+  pendingOfferActionRequests.delete(requestId);
+  if (payload?.ok) {
+    entry.resolve(payload);
+  } else {
+    entry.reject(new Error(String(payload?.message || "Packet action failed.")));
   }
+  return true;
 }
 
 function applyPacketToProgression(current, packet) {
@@ -293,7 +363,10 @@ async function askGmRequest(actor, requestType, payload) {
 
 async function acceptLevelOffer(actor, offer, packetOverride = null) {
   const packet = packetOverride || offer?.packet || {};
-  const progression = actor.getFlag(MODULE_ID, "progression") || {};
+  const progressionRaw = actor.getFlag(MODULE_ID, "progression") || {};
+  const progression = progressionRaw && Number(progressionRaw.level || 0) > 0
+    ? progressionRaw
+    : fallbackProgressionFromPacket(packet);
   const next = applyPacketToProgression(progression, packet);
   const offerId = String(offer?.offerId || "");
   const remainingOffers = getOfferList(actor).filter((o) => String(o.offerId || "") !== offerId);
@@ -343,92 +416,27 @@ async function openLevelOffer(actor, offer) {
   const progression = actor.getFlag(MODULE_ID, "progression") || {};
   const packet = offer.packet || {};
   const pType = normKey(packet.packetType || "standard");
-  let trackers = ensureTrackers(actor, progression);
-  try {
-    await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
-  } catch (_err) {
-    // non-owner players may not have write permission; continue with local state
-  }
+  const trackers = ensureTrackers(actor, progression);
+  const display = offerDisplayModel(packet);
 
   const content = () => {
-    const rows = buildSkillTableRows(progression, trackers) || `<tr><td colspan="5">No skills found.</td></tr>`;
+    const rows = buildSkillTableRows(progression, trackers) || `<tr><td colspan="4">No skills found.</td></tr>`;
     return `
 <div class="wi-level-offer">
-  <p><strong>Level Granted:</strong> ${escapeHtml(actor.name)}</p>
-  <p>Type: <strong>${escapeHtml(pType)}</strong> | Delta Levels: <strong>${Number(packet.deltaLevels || 1)}</strong></p>
-  <p>Class Target: <strong>${escapeHtml(packet.classId || "primary")}</strong></p>
-  <p>You can accept or reject this grant. If rejected, no level change is applied.</p>
-  <div class="wi-offer-actions">
-    <button type="button" data-action="refresh-scene">Refresh Scene Uses</button>
-    <button type="button" data-action="refresh-rest">Refresh Rest Uses</button>
-    <button type="button" data-action="refresh-day">Refresh Day Uses</button>
+  <div class="wi-level-offer-hero wi-level-offer-${escapeHtml(display.accent)}">
+    <div class="wi-level-offer-title">${escapeHtml(display.title)}</div>
+    <div class="wi-level-offer-subtitle">${escapeHtml(display.subtitle)}</div>
+    <div class="wi-level-offer-detail">${escapeHtml(display.detail)}</div>
+    <div class="wi-level-offer-target">Character: <strong>${escapeHtml(actor.name)}</strong></div>
   </div>
+  <p>If you reject this offer, no progression changes are applied.</p>
   <h4>Current Skills</h4>
   <table class="wi-ledger-table wi-skill-table">
-    <thead><tr><th>Skill</th><th>Cooldown</th><th>Limited Uses</th><th>Reset</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Skill</th><th>Cooldown</th><th>Limited Uses</th><th>Reset</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>
 </div>`;
   };
-
-  const attachSkillHandlers = (html, dialogRef) => {
-    html.on("click", "button[data-action='skill-use']", async (ev) => {
-      const sid = String(ev.currentTarget.dataset.skillId || "");
-      const t = trackers[sid] || { usesMax: 0, usesRemaining: 0, per: "scene", cooldownBase: 0, cooldownRemaining: 0 };
-      if (Number(t.usesMax || 0) > 0 && Number(t.usesRemaining || 0) <= 0) {
-        ui.notifications.warn("No uses remaining for this skill.");
-        return;
-      }
-      if (Number(t.usesMax || 0) > 0) t.usesRemaining = Math.max(0, Number(t.usesRemaining || 0) - 1);
-      t.cooldownRemaining = Math.max(Number(t.cooldownRemaining || 0), Number(t.cooldownBase || 0));
-      t.updatedAt = new Date().toISOString();
-      trackers[sid] = t;
-      actor.setFlag(MODULE_ID, "skillTrackers", trackers).catch(() => {});
-      dialogRef.data.content = content();
-      dialogRef.render(true);
-    });
-
-    html.on("click", "button[data-action='skill-recharge']", async (ev) => {
-      const sid = String(ev.currentTarget.dataset.skillId || "");
-      const t = trackers[sid] || { usesMax: 0, usesRemaining: 0, per: "scene", cooldownBase: 0, cooldownRemaining: 0 };
-      t.cooldownRemaining = 0;
-      if (Number(t.usesMax || 0) > 0) t.usesRemaining = Number(t.usesMax || 0);
-      t.updatedAt = new Date().toISOString();
-      trackers[sid] = t;
-      actor.setFlag(MODULE_ID, "skillTrackers", trackers).catch(() => {});
-      dialogRef.data.content = content();
-      dialogRef.render(true);
-    });
-
-    html.on("click", "button[data-action='skill-gm-refresh']", async (ev) => {
-      const sid = String(ev.currentTarget.dataset.skillId || "");
-      await askGmRequest(actor, "skill_refresh", { skill_id: sid, offer_id: offer.offerId || "" });
-      ui.notifications.info(`Sent GM refresh request for ${sid}.`);
-    });
-
-    html.on("click", "button[data-action='refresh-scene'], button[data-action='refresh-rest'], button[data-action='refresh-day']", async (ev) => {
-      const action = String(ev.currentTarget.dataset.action || "refresh-scene");
-      const per = action.replace("refresh-", "");
-      Object.keys(trackers).forEach((sid) => {
-        const t = trackers[sid];
-        if (!t) return;
-        if (per === "scene" || normKey(t.per) === per) {
-          if (Number(t.usesMax || 0) > 0) t.usesRemaining = Number(t.usesMax || 0);
-          t.cooldownRemaining = 0;
-          t.updatedAt = new Date().toISOString();
-        }
-      });
-      try {
-        await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
-      } catch (_err) {
-        // non-owner: keep local-only tracker state
-      }
-      dialogRef.data.content = content();
-      dialogRef.render(true);
-    });
-  };
-
-  let renderHook = null;
   const dialog = new Dialog({
     title: `Level Offer: ${actor.name}`,
     content: content(),
@@ -438,8 +446,8 @@ async function openLevelOffer(actor, offer) {
         callback: async () => {
           try {
             if (!actor.isOwner && !game.user?.isGM) {
-              await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "accept");
-              ui.notifications.info(`Acceptance sent to GM for ${actor.name}`);
+              const ack = await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "accept");
+              ui.notifications.info(String(ack?.message || `Accepted level offer for ${actor.name}`));
               return;
             }
             await acceptLevelOffer(actor, offer, packet);
@@ -453,32 +461,19 @@ async function openLevelOffer(actor, offer) {
         label: "Reject",
         callback: async () => {
           if (!actor.isOwner && !game.user?.isGM) {
-            await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "reject");
-            ui.notifications.warn(`Rejection sent to GM for ${actor.name}`);
+            const ack = await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "reject");
+            ui.notifications.warn(String(ack?.message || `Rejected level offer for ${actor.name}`));
             return;
           }
           await rejectLevelOffer(actor, offer.offerId || "", pType);
           ui.notifications.warn(`Rejected level offer for ${actor.name}; no level granted.`);
         }
-      },
-      ask: {
-        label: "Ask GM To Refresh",
-        callback: async () => {
-          await askGmRequest(actor, "refresh_level_offer", { offer_id: offer.offerId || "" });
-          ui.notifications.info("Sent refresh request to GM queue.");
-        }
       }
     },
     default: "accept",
     close: () => {
-      if (renderHook != null) Hooks.off("renderDialog", renderHook);
       openOfferMap.delete(key);
     }
-  });
-
-  renderHook = Hooks.on("renderDialog", (app, html) => {
-    if (app !== dialog) return;
-    attachSkillHandlers(html, dialog);
   });
   dialog.render(true);
 }
@@ -559,6 +554,12 @@ export function registerPlayerProgression() {
     notifyGmDeliveredOffers().catch((err) => console.error("[wi-core-foundry] GM delivery notify scan failed", err));
     game.socket?.on(`module.${MODULE_ID}`, (payload) => {
       if (!payload) return;
+      if (payload.type === "level-offer-action-result") {
+        const me = String(game.user?.id || "");
+        if (String(payload.userId || "") !== me) return;
+        resolvePendingActionRequest(payload);
+        return;
+      }
 
       if (payload.type === "level-offer-notify") {
         const userIds = Array.isArray(payload.userIds) ? payload.userIds.map((x) => String(x)) : [];
@@ -596,23 +597,69 @@ export function registerPlayerProgression() {
       }
 
       if (payload.type === "level-offer-action-request" && game.user?.isGM) {
+        const primaryGm = primaryActiveGmId();
+        if (primaryGm && primaryGm !== String(game.user?.id || "")) return;
         const actor = game.actors.get(String(payload.actorId || ""));
-        if (!actor) return;
+        const requestId = String(payload.requestId || "");
+        const requesterId = String(payload.userId || "");
+        const sendResult = (ok, message) => {
+          try {
+            game.socket?.emit(`module.${MODULE_ID}`, {
+              type: "level-offer-action-result",
+              requestId,
+              userId: requesterId,
+              actorId: String(payload.actorId || ""),
+              offerId: String(payload.offerId || ""),
+              action: String(payload.action || ""),
+              ok: !!ok,
+              message: String(message || ""),
+            });
+          } catch (_err) {
+            // no-op
+          }
+        };
+        if (!actor) {
+          sendResult(false, "Actor not found.");
+          return;
+        }
         const offers = getOfferList(actor);
         const offer = offers.find((o) => String(o.offerId || "") === String(payload.offerId || "")) || actor.getFlag(MODULE_ID, "levelOffer");
-        if (!offer?.packet) return;
+        if (!offer?.packet) {
+          sendResult(false, "Offer not found.");
+          return;
+        }
         const action = String(payload.action || "");
         if (action === "accept") {
           acceptLevelOffer(actor, offer, offer.packet)
-            .then(() => ui.notifications.info(`GM applied accepted packet for ${actor.name}.`))
-            .catch((err) => ui.notifications.error(String(err?.message || err)));
+            .then((out) => {
+              const lvl = Number(out?.progression?.level || 0);
+              const msg = lvl > 0
+                ? `Accepted. ${actor.name} is now level ${lvl}.`
+                : `Accepted. ${actor.name} progression applied.`;
+              ui.notifications.info(`GM applied accepted packet for ${actor.name}.`);
+              sendResult(true, msg);
+            })
+            .catch((err) => {
+              const msg = String(err?.message || err);
+              ui.notifications.error(msg);
+              sendResult(false, msg);
+            });
           return;
         }
         if (action === "reject") {
           rejectLevelOffer(actor, String(offer.offerId || ""), String(offer.packet?.packetType || ""))
-            .then(() => ui.notifications.warn(`GM recorded rejected packet for ${actor.name}.`))
-            .catch((err) => ui.notifications.error(String(err?.message || err)));
+            .then(() => {
+              ui.notifications.warn(`GM recorded rejected packet for ${actor.name}.`);
+              sendResult(true, `Rejected. No progression changes applied for ${actor.name}.`);
+            })
+            .catch((err) => {
+              const msg = String(err?.message || err);
+              ui.notifications.error(msg);
+              sendResult(false, msg);
+            });
+          return;
         }
+        sendResult(false, `Unsupported action: ${action || "unknown"}`);
       }
     });
   });
@@ -652,8 +699,8 @@ export function registerPlayerProgression() {
         const offers = getOfferList(actor);
         const liveOffer = offers.find((o) => String(o.offerId || "") === offerId) || { offerId, packet };
         if (!actor.isOwner && !game.user?.isGM) {
-          await requestOfferActionFromGm(actor.id, offerId, liveOffer?.packet || packet || {}, "accept");
-          ui.notifications.info(`Acceptance sent to GM for ${actor.name}`);
+          const ack = await requestOfferActionFromGm(actor.id, offerId, liveOffer?.packet || packet || {}, "accept");
+          ui.notifications.info(String(ack?.message || `Accepted level packet for ${actor.name}`));
           return;
         }
         await acceptLevelOffer(actor, liveOffer, liveOffer?.packet || packet || {});
@@ -675,8 +722,8 @@ export function registerPlayerProgression() {
           return;
         }
         if (!actor.isOwner && !game.user?.isGM) {
-          await requestOfferActionFromGm(actor.id, offerId, packet || {}, "reject");
-          ui.notifications.warn(`Rejection sent to GM for ${actor.name}`);
+          const ack = await requestOfferActionFromGm(actor.id, offerId, packet || {}, "reject");
+          ui.notifications.warn(String(ack?.message || `Rejected level packet for ${actor.name}`));
           return;
         }
         const pType = String(packet?.packetType || "");

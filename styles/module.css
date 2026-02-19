@@ -222,6 +222,48 @@
   overflow: auto;
 }
 
+.wi-level-offer-hero {
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.wi-level-offer-title {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.wi-level-offer-subtitle {
+  font-size: 13px;
+  opacity: 0.9;
+  margin-top: 2px;
+}
+
+.wi-level-offer-detail {
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+.wi-level-offer-target {
+  font-size: 12px;
+  margin-top: 4px;
+  opacity: 0.85;
+}
+
+.wi-level-offer-levelup {
+  background: linear-gradient(135deg, rgba(122, 186, 120, 0.22), rgba(84, 142, 76, 0.14));
+}
+
+.wi-level-offer-newclass {
+  background: linear-gradient(135deg, rgba(93, 160, 214, 0.22), rgba(47, 109, 170, 0.14));
+}
+
+.wi-level-offer-evolution {
+  background: linear-gradient(135deg, rgba(209, 161, 89, 0.25), rgba(148, 102, 39, 0.15));
+}
+
 .wi-offer-actions {
   display: flex;
   flex-wrap: wrap;
