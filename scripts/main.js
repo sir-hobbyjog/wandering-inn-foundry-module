@@ -1,6 +1,7 @@
 import { apiRequest } from "./api-client.js";
 import { registerActorSyncHook } from "./actor-sync.js";
 import { registerNpcPanel } from "./chat-ui.js";
+import { registerDmConsole } from "./dm-console.js";
 
 const MODULE_ID = "wi-core-foundry";
 
@@ -54,6 +55,14 @@ function registerSettings() {
     config: true,
     type: String,
     default: "setting"
+  });
+  game.settings.register(MODULE_ID, "gmDebugMode", {
+    name: "Enable DM Prompt Debug by default",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: false,
+    restricted: true
   });
 
   game.settings.register(MODULE_ID, "hpMaxPath", {
@@ -118,12 +127,46 @@ function registerKeybindings() {
       return true;
     }
   });
+
+  game.keybindings.register(MODULE_ID, "openDmConsole", {
+    name: "Open DM Console",
+    hint: "GM-only shortcut: open the prompt trace debug console.",
+    restricted: true,
+    editable: [{ key: "KeyD", modifiers: ["Shift", "Alt"] }],
+    onDown: () => {
+      game.wiCore.openDmConsole().catch((err) => console.error("[wi-core-foundry] DM console hotkey failed", err));
+      return true;
+    }
+  });
+}
+
+function registerSceneControlButton() {
+  Hooks.on("getSceneControlButtons", (controls) => {
+    if (!game.user?.isGM) return;
+    const tokenControls = controls.find((c) => c.name === "token");
+    if (!tokenControls) return;
+    const alreadyPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenDmConsole");
+    if (alreadyPresent) return;
+
+    tokenControls.tools.push({
+      name: "wiCoreOpenDmConsole",
+      title: "Open WI DM Console",
+      icon: "fas fa-scroll",
+      button: true,
+      visible: true,
+      onClick: () => {
+        game.wiCore.openDmConsole().catch((err) => console.error("[wi-core-foundry] scene control DM console failed", err));
+      }
+    });
+  });
 }
 
 Hooks.once("init", () => {
   registerSettings();
   registerNpcPanel();
+  registerDmConsole();
   registerKeybindings();
+  registerSceneControlButton();
 });
 
 Hooks.once("ready", async () => {
@@ -138,5 +181,6 @@ Hooks.once("ready", async () => {
 
   game.wiCore = game.wiCore || {};
   game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
+  game.wiCore.openDmConsole = game.wiCore.openDmConsole || (async () => {});
   game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
 });

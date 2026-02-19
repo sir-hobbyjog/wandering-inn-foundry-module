@@ -8,3 +8,27 @@
   grid-column: 2;
   min-height: 110px;
 }
+
+.wi-dm-console {
+  min-width: 760px;
+}
+
+.wi-dm-head {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.wi-dm-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.wi-dm-pane pre {
+  max-height: 440px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 8px;
+}
