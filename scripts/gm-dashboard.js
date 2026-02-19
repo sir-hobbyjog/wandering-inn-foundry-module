@@ -97,6 +97,13 @@ function activityTagCounts(rows) {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
 }
 
+function parseCsvList(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((s) => normKey(s))
+    .filter(Boolean);
+}
+
 async function mutateProgression(actor, fn) {
   const current = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
   const next = foundry.utils.deepClone(current);
@@ -469,6 +476,19 @@ class WICoreGMDashboard extends Application {
     return rows;
   }
 
+  _readAllDraftSkillRowsFromUi(root) {
+    return root.find(".wi-skill-row").map((_, el) => {
+      const row = $(el);
+      return {
+        enabled: !!row.find(".wi-skill-enabled").is(":checked"),
+        source: String(row.find(".wi-skill-source").val() || "llm"),
+        name: String(row.find(".wi-skill-name").val() || ""),
+        description: String(row.find(".wi-skill-description").val() || ""),
+        cooldown: Number(row.find(".wi-skill-cooldown").val() || 0)
+      };
+    }).get();
+  }
+
   async _generateSkillSuggestions(actor, classId, deltaLevels) {
     const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
     const meta = ensureDashboardMeta(actor);
@@ -695,7 +715,7 @@ class WICoreGMDashboard extends Application {
     const overview = selected ? `
 <div class="wi-overview-grid">
   <div><label>Current Class Stack</label><p>${escapeHtml(selected.classSummary)}</p></div>
-  <div><label>Species</label><p>${escapeHtml(selected.speciesSummary)}</p></div>
+  <div><label>Species</label><p>${escapeHtml(selected.speciesSummary)}</p><div class="wi-tab-actions"><button type="button" data-action="edit-species" data-actor-id="${selected.actorId}">Edit Species</button></div></div>
   <div><label>Next Unlock Preview</label><p>${escapeHtml(this._nextUnlock(selected.progression))}</p></div>
   <div><label>Suggested Direction</label><p>${escapeHtml(this._suggestedDirection(selected))}</p><p class="wi-mini">${escapeHtml(pendingPacketNote)}</p></div>
 </div>
@@ -898,6 +918,7 @@ ${historyRows}
       if (action === "quick-level") return this._onQuickLevel(actorId);
       if (action === "open-sheet") return this._onOpenSheet(actorId);
       if (action === "send-packet") return this._onSendPacket(actorId);
+      if (action === "edit-species") return this._onEditSpecies(actorId);
       if (action === "generate-skills") return this._onGenerateSkills(actorId, $root);
       if (action === "add-custom-skill") return this._onAddCustomSkill(actorId);
       if (action === "stage-levelup") return this._onStageLevelUp(actorId, $root);
@@ -1018,6 +1039,103 @@ ${historyRows}
     actor.sheet?.render(true);
   }
 
+  async _onEditSpecies(actorId) {
+    const actor = game.actors.get(actorId);
+    if (!actor) return;
+    const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
+    const currentSpecies = normKey(progression?.species?.primary || "human");
+
+    let catalog = [];
+    try {
+      const out = await apiRequest("/progression/catalog/species?limit=1000");
+      catalog = Array.isArray(out.items) ? out.items : [];
+    } catch (_err) {
+      catalog = [];
+    }
+
+    const byId = new Map(catalog.map((s) => [normKey(s.species_id), s]));
+    if (currentSpecies && !byId.has(currentSpecies)) {
+      byId.set(currentSpecies, { species_id: currentSpecies, name: currentSpecies, traits: [], tags: ["custom"] });
+    }
+    const options = [...byId.values()]
+      .sort((a, b) => String(a.name || a.species_id).localeCompare(String(b.name || b.species_id)))
+      .map((s) => `<option value="${escapeHtml(String(s.species_id || ""))}" ${normKey(s.species_id) === currentSpecies ? "selected" : ""}>${escapeHtml(String(s.name || s.species_id))}</option>`)
+      .join("");
+    const content = `
+<div class="wi-form-row">
+  <label>Species</label>
+  <select id="wi-species-select">${options}<option value="__custom__">Custom...</option></select>
+</div>
+<div class="wi-form-row">
+  <label>Custom Species ID</label>
+  <input id="wi-species-custom" type="text" value="${escapeHtml(currentSpecies)}" />
+</div>
+<div class="wi-form-row">
+  <label>Subtypes (comma-separated)</label>
+  <input id="wi-species-subtypes" type="text" value="${escapeHtml((progression?.species?.subtypes || []).join(", "))}" />
+</div>
+<div class="wi-form-row">
+  <label>Traits (comma-separated)</label>
+  <input id="wi-species-traits" type="text" value="${escapeHtml((progression?.species?.traits || []).join(", "))}" />
+</div>`;
+
+    const values = await new Promise((resolve) => {
+      const dialog = new Dialog({
+        title: `Edit Species: ${actor.name}`,
+        content,
+        buttons: {
+          save: {
+            label: "Save Species",
+            callback: (html) => {
+              const pick = String(html.find("#wi-species-select").val() || "").trim();
+              const custom = String(html.find("#wi-species-custom").val() || "").trim();
+              const primary = pick === "__custom__" ? custom : pick;
+              resolve({
+                primary,
+                subtypes: String(html.find("#wi-species-subtypes").val() || ""),
+                traits: String(html.find("#wi-species-traits").val() || ""),
+              });
+            },
+          },
+          cancel: { label: "Cancel", callback: () => resolve(null) },
+        },
+        default: "save",
+        render: (html) => {
+          const syncCustom = () => {
+            const pick = String(html.find("#wi-species-select").val() || "").trim();
+            const customInput = html.find("#wi-species-custom");
+            customInput.prop("disabled", pick !== "__custom__");
+            if (pick && pick !== "__custom__") customInput.val(pick);
+          };
+          html.on("change", "#wi-species-select", syncCustom);
+          syncCustom();
+        },
+        close: () => resolve(null),
+      });
+      dialog.render(true);
+    });
+    if (!values) return;
+    if (!normKey(values.primary)) {
+      ui.notifications.warn("Species ID is required.");
+      return;
+    }
+
+    try {
+      await mutateProgression(actor, (prog) => {
+        prog.species = {
+          ...(prog.species || {}),
+          primary: normKey(values.primary),
+          subtypes: parseCsvList(values.subtypes),
+          traits: parseCsvList(values.traits),
+        };
+      });
+      ui.notifications.info(`Updated species for ${actor.name}`);
+      this.render();
+    } catch (err) {
+      ui.notifications.error(String(err.message || err));
+    }
+  }
+
   async _onSendPacket(actorId) {
     const actor = game.actors.get(actorId);
     if (!actor) return;
@@ -1032,10 +1150,29 @@ ${historyRows}
       createdAt: new Date().toISOString(),
       packet
     };
-    const owners = game.users.filter((u) => actor.testUserPermission(u, "OWNER"));
-    const playerOwners = owners.filter((u) => !u.isGM);
-    const whisperTargets = playerOwners.length ? playerOwners : owners;
-    const whisperUserIds = whisperTargets.map((u) => String(u.id || "")).filter(Boolean);
+    const linkedCharacterUsers = game.users.filter((u) => !u.isGM && String(u.character?.id || "") === actor.id);
+    const ownerUsers = game.users.filter((u) => actor.testUserPermission(u, "OWNER"));
+    const nonGmOwners = ownerUsers.filter((u) => !u.isGM);
+    const nonGmObservers = game.users.filter((u) => !u.isGM && actor.testUserPermission(u, "OBSERVER"));
+
+    let targetUsers = linkedCharacterUsers.length ? linkedCharacterUsers : nonGmOwners;
+    if (!targetUsers.length) targetUsers = nonGmObservers;
+    if (!targetUsers.length) {
+      const allNonGm = game.users.filter((u) => !u.isGM);
+      if (allNonGm.length === 1) targetUsers = allNonGm;
+    }
+    if (!targetUsers.length) targetUsers = ownerUsers.length ? ownerUsers : [game.user];
+
+    const targetUserIds = [...new Set(targetUsers.map((u) => String(u.id || "")).filter(Boolean))];
+    const offlineUserIds = targetUsers
+      .filter((u) => !u.active)
+      .map((u) => String(u.id || ""))
+      .filter(Boolean);
+    const offlineNames = targetUsers.filter((u) => !u.active).map((u) => String(u.name || u.id || ""));
+    offer.targetUserIds = targetUserIds;
+    offer.deliveredToUserIds = [];
+    offer.status = "open";
+
     const skillLines = (packet.skillPicks || [])
       .map((s) => `<li><strong>${escapeHtml(s.name || s.skillId || "Skill")}</strong>: ${escapeHtml(s.description || "")}</li>`)
       .join("");
@@ -1052,7 +1189,7 @@ ${historyRows}
     await ChatMessage.create({
       content,
       speaker: { alias: "GM Progression Packet" },
-      whisper: whisperUserIds,
+      whisper: targetUserIds,
       flags: {
         [MODULE_ID]: {
           levelOfferChat: {
@@ -1063,13 +1200,19 @@ ${historyRows}
         }
       }
     });
+    const existingOffers = Array.isArray(actor.getFlag(MODULE_ID, "levelOffers"))
+      ? actor.getFlag(MODULE_ID, "levelOffers")
+      : [];
+    const nextOffers = [...existingOffers.filter((o) => o && String(o.offerId || "") !== offer.offerId), offer];
+    await actor.setFlag(MODULE_ID, "levelOffers", nextOffers);
     await actor.setFlag(MODULE_ID, "levelOffer", offer);
     try {
       game.socket?.emit(`module.${MODULE_ID}`, {
         type: "level-offer-notify",
         actorId: actor.id,
         offerId: offer.offerId,
-        userIds: whisperUserIds
+        userIds: targetUserIds,
+        offlineUserIds
       });
     } catch (_err) {
       // no-op: flag update remains the primary transport
@@ -1078,8 +1221,10 @@ ${historyRows}
       ...meta,
       stagedPacket: { ...packet, sentAt: new Date().toISOString() }
     });
-    if (!playerOwners.length) {
-      ui.notifications.warn(`No non-GM owner found for ${actor.name}. Packet was sent to current owners only.`);
+    if (targetUserIds.length === 0) {
+      ui.notifications.warn(`No player recipient resolved for ${actor.name}.`);
+    } else if (offlineUserIds.length) {
+      ui.notifications.warn(`Packet queued for offline player(s): ${offlineNames.join(", ")}. It will open on next login.`);
     }
     ui.notifications.info(`Sent staged packet for ${actor.name}`);
     this.render();
@@ -1264,7 +1409,12 @@ ${historyRows}
     if (Number(skillIndex) < 0) return;
     const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
     const draft = this._getDraft(actor, progression);
-    const row = (draft?.skillRows || [])[Number(skillIndex)];
+    const liveRows = this._readAllDraftSkillRowsFromUi(this.element);
+    const workingRows = liveRows.length ? liveRows : (draft?.skillRows || []);
+    if (liveRows.length) {
+      this._setDraft(actor.id, { ...draft, skillRows: liveRows });
+    }
+    const row = workingRows[Number(skillIndex)];
     if (!row) return;
     try {
       const out = await apiRequest("/foundry/actor/skill-polish", {
@@ -1278,10 +1428,10 @@ ${historyRows}
           existing_skill_names: (progression.skills || []).map((s) => String(s.name || s.skillId || ""))
         }
       });
-      const nextRows = [...(draft?.skillRows || [])];
+      const nextRows = [...workingRows];
       nextRows[Number(skillIndex)] = {
         ...nextRows[Number(skillIndex)],
-        name: String(out.name || nextRows[Number(skillIndex)].name || ""),
+        name: String(nextRows[Number(skillIndex)].name || out.name || ""),
         description: String(out.description || nextRows[Number(skillIndex)].description || ""),
         cooldown: Number(out.cooldown || nextRows[Number(skillIndex)].cooldown || 0),
         source: "llm"

@@ -80,6 +80,88 @@ function xpCostForLevels(currentLevel, deltaLevels) {
   return Math.max(0, cost);
 }
 
+function getOfferList(actor) {
+  const list = Array.isArray(actor.getFlag(MODULE_ID, "levelOffers")) ? actor.getFlag(MODULE_ID, "levelOffers") : [];
+  const legacy = actor.getFlag(MODULE_ID, "levelOffer");
+  const merged = [...list];
+  if (legacy?.offerId && !merged.some((o) => String(o?.offerId || "") === String(legacy.offerId))) {
+    merged.push(legacy);
+  }
+  const byId = new Map();
+  for (const row of merged) {
+    if (!row || !row.packet) continue;
+    const id = String(row.offerId || "");
+    if (!id) continue;
+    byId.set(id, row);
+  }
+  return [...byId.values()];
+}
+
+async function setOfferList(actor, offers) {
+  const next = (Array.isArray(offers) ? offers : []).filter((o) => o && o.packet);
+  const open = next.find((o) => String(o.status || "open") === "open") || null;
+  await actor.setFlag(MODULE_ID, "levelOffers", next);
+  await actor.setFlag(MODULE_ID, "levelOffer", open);
+}
+
+function offerTargetsUser(offer, userId) {
+  const targets = Array.isArray(offer?.targetUserIds) ? offer.targetUserIds.map((x) => String(x)) : [];
+  if (!targets.length) return true;
+  return targets.includes(String(userId || ""));
+}
+
+async function markOfferDelivered(actor, offer, userId) {
+  if (!actor?.isOwner && !game.user?.isGM) return false;
+  const all = getOfferList(actor);
+  const idx = all.findIndex((o) => String(o.offerId || "") === String(offer?.offerId || ""));
+  if (idx < 0) return false;
+  const row = foundry.utils.deepClone(all[idx]);
+  const delivered = new Set((row.deliveredToUserIds || []).map((x) => String(x)));
+  const me = String(userId || "");
+  if (!me || delivered.has(me)) return false;
+  delivered.add(me);
+  row.deliveredToUserIds = [...delivered];
+  row.lastDeliveredAt = new Date().toISOString();
+  all[idx] = row;
+  await setOfferList(actor, all);
+  return true;
+}
+
+async function requestOfferActionFromGm(actorId, offerId, packet, action) {
+  const sid = await resolveSessionId();
+  try {
+    await apiRequest("/foundry/actor/request", {
+      method: "POST",
+      body: {
+        world_id: game.world.id,
+        actor_id: String(actorId || ""),
+        session_id: sid,
+        request_type: action === "accept" ? "level_offer_accept" : "level_offer_reject",
+        payload: {
+          offer_id: String(offerId || ""),
+          packet_type: String(packet?.packetType || ""),
+        },
+        priority: 25,
+        status: "open",
+      },
+    });
+  } catch (_err) {
+    // best effort
+  }
+  try {
+    game.socket?.emit(`module.${MODULE_ID}`, {
+      type: "level-offer-action-request",
+      actorId: String(actorId || ""),
+      offerId: String(offerId || ""),
+      action: action === "accept" ? "accept" : "reject",
+      userId: String(game.user?.id || ""),
+      userName: String(game.user?.name || ""),
+    });
+  } catch (_err) {
+    // no-op
+  }
+}
+
 function applyPacketToProgression(current, packet) {
   const next = foundry.utils.deepClone(current);
   const pType = normKey(packet.packetType || "standard");
@@ -213,10 +295,13 @@ async function acceptLevelOffer(actor, offer, packetOverride = null) {
   const packet = packetOverride || offer?.packet || {};
   const progression = actor.getFlag(MODULE_ID, "progression") || {};
   const next = applyPacketToProgression(progression, packet);
+  const offerId = String(offer?.offerId || "");
+  const remainingOffers = getOfferList(actor).filter((o) => String(o.offerId || "") !== offerId);
   const out = await syncProgression(actor, next);
   await actor.update({
     [`flags.${MODULE_ID}.progression`]: out.progression,
     [`flags.${MODULE_ID}.levelOffer`]: null,
+    [`flags.${MODULE_ID}.levelOffers`]: remainingOffers,
     [`flags.${MODULE_ID}.dashboard.pendingChoices`]: false,
     [`flags.${MODULE_ID}.dashboard.stagedPacket`]: null
   });
@@ -225,7 +310,8 @@ async function acceptLevelOffer(actor, offer, packetOverride = null) {
 
 async function rejectLevelOffer(actor, offerId, packetType = "") {
   await askGmRequest(actor, "level_offer_rejected", { offer_id: offerId || "", packet_type: packetType || "" });
-  await actor.setFlag(MODULE_ID, "levelOffer", null);
+  const remainingOffers = getOfferList(actor).filter((o) => String(o.offerId || "") !== String(offerId || ""));
+  await setOfferList(actor, remainingOffers);
 }
 
 async function openLevelOffer(actor, offer) {
@@ -233,11 +319,36 @@ async function openLevelOffer(actor, offer) {
   if (openOfferMap.get(key)) return;
   openOfferMap.set(key, true);
 
+  const me = String(game.user?.id || "");
+  if (!offerTargetsUser(offer, me)) {
+    openOfferMap.delete(key);
+    return;
+  }
+  try {
+    const delivered = await markOfferDelivered(actor, offer, me);
+    if (delivered || !actor.isOwner) {
+      game.socket?.emit(`module.${MODULE_ID}`, {
+        type: "level-offer-delivered",
+        actorId: actor.id,
+        actorName: actor.name,
+        offerId: String(offer.offerId || ""),
+        userId: me,
+        userName: String(game.user?.name || ""),
+      });
+    }
+  } catch (_err) {
+    // best effort
+  }
+
   const progression = actor.getFlag(MODULE_ID, "progression") || {};
   const packet = offer.packet || {};
   const pType = normKey(packet.packetType || "standard");
   let trackers = ensureTrackers(actor, progression);
-  await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+  try {
+    await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+  } catch (_err) {
+    // non-owner players may not have write permission; continue with local state
+  }
 
   const content = () => {
     const rows = buildSkillTableRows(progression, trackers) || `<tr><td colspan="5">No skills found.</td></tr>`;
@@ -272,7 +383,7 @@ async function openLevelOffer(actor, offer) {
       t.cooldownRemaining = Math.max(Number(t.cooldownRemaining || 0), Number(t.cooldownBase || 0));
       t.updatedAt = new Date().toISOString();
       trackers[sid] = t;
-      actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+      actor.setFlag(MODULE_ID, "skillTrackers", trackers).catch(() => {});
       dialogRef.data.content = content();
       dialogRef.render(true);
     });
@@ -284,7 +395,7 @@ async function openLevelOffer(actor, offer) {
       if (Number(t.usesMax || 0) > 0) t.usesRemaining = Number(t.usesMax || 0);
       t.updatedAt = new Date().toISOString();
       trackers[sid] = t;
-      actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+      actor.setFlag(MODULE_ID, "skillTrackers", trackers).catch(() => {});
       dialogRef.data.content = content();
       dialogRef.render(true);
     });
@@ -307,7 +418,11 @@ async function openLevelOffer(actor, offer) {
           t.updatedAt = new Date().toISOString();
         }
       });
-      await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+      try {
+        await actor.setFlag(MODULE_ID, "skillTrackers", trackers);
+      } catch (_err) {
+        // non-owner: keep local-only tracker state
+      }
       dialogRef.data.content = content();
       dialogRef.render(true);
     });
@@ -322,6 +437,11 @@ async function openLevelOffer(actor, offer) {
         label: "Accept",
         callback: async () => {
           try {
+            if (!actor.isOwner && !game.user?.isGM) {
+              await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "accept");
+              ui.notifications.info(`Acceptance sent to GM for ${actor.name}`);
+              return;
+            }
             await acceptLevelOffer(actor, offer, packet);
             ui.notifications.info(`Accepted level offer for ${actor.name}`);
           } catch (err) {
@@ -332,6 +452,11 @@ async function openLevelOffer(actor, offer) {
       reject: {
         label: "Reject",
         callback: async () => {
+          if (!actor.isOwner && !game.user?.isGM) {
+            await requestOfferActionFromGm(actor.id, offer.offerId || "", packet, "reject");
+            ui.notifications.warn(`Rejection sent to GM for ${actor.name}`);
+            return;
+          }
           await rejectLevelOffer(actor, offer.offerId || "", pType);
           ui.notifications.warn(`Rejected level offer for ${actor.name}; no level granted.`);
         }
@@ -360,41 +485,113 @@ async function openLevelOffer(actor, offer) {
 
 async function scanAndOpenOffers() {
   if (!game.user) return;
+  const me = String(game.user.id || "");
   for (const actor of game.actors.contents) {
     if (!actor?.id) continue;
-    if (!actor.isOwner) continue;
-    const offer = actor.getFlag(MODULE_ID, "levelOffer");
-    if (offer && offer.packet) {
+    const offers = getOfferList(actor);
+    for (const offer of offers) {
+      if (!offer?.packet) continue;
+      if (String(offer.status || "open") !== "open") continue;
+      if (!offerTargetsUser(offer, me)) continue;
       openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] level offer dialog failed", err));
     }
+  }
+}
+
+async function notifyGmDeliveredOffers() {
+  if (!game.user?.isGM) return;
+  for (const actor of game.actors.contents) {
+    if (!actor?.id || !actor.isOwner) continue;
+    const offers = getOfferList(actor);
+    let touched = false;
+    for (const offer of offers) {
+      const deliveredTo = Array.isArray(offer.deliveredToUserIds) ? offer.deliveredToUserIds.map((x) => String(x)) : [];
+      if (!deliveredTo.length) continue;
+      if (offer.gmNotifiedAt) continue;
+      const names = deliveredTo.map((id) => game.users.get(id)?.name || id).join(", ");
+      ui.notifications.info(`Packet delivered to ${names} for ${actor.name}.`);
+      offer.gmNotifiedAt = new Date().toISOString();
+      touched = true;
+    }
+    if (touched) await setOfferList(actor, offers);
   }
 }
 
 export function registerPlayerProgression() {
   Hooks.once("ready", () => {
     scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] offer scan failed", err));
+    notifyGmDeliveredOffers().catch((err) => console.error("[wi-core-foundry] GM delivery notify scan failed", err));
     game.socket?.on(`module.${MODULE_ID}`, (payload) => {
-      if (!payload || payload.type !== "level-offer-notify") return;
-      const userIds = Array.isArray(payload.userIds) ? payload.userIds.map((x) => String(x)) : [];
-      const me = String(game.user?.id || "");
-      if (userIds.length && !userIds.includes(me)) return;
-      const actor = game.actors.get(String(payload.actorId || ""));
-      if (!actor || !actor.isOwner) return;
-      const offer = actor.getFlag(MODULE_ID, "levelOffer");
-      if (offer && offer.packet) {
-        openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] socket offer open failed", err));
-      } else {
-        scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] socket scan failed", err));
+      if (!payload) return;
+
+      if (payload.type === "level-offer-notify") {
+        const userIds = Array.isArray(payload.userIds) ? payload.userIds.map((x) => String(x)) : [];
+        const me = String(game.user?.id || "");
+        if (userIds.length && !userIds.includes(me)) return;
+        const actor = game.actors.get(String(payload.actorId || ""));
+        if (!actor) return;
+        const offers = getOfferList(actor);
+        const target = offers.find((o) => String(o.offerId || "") === String(payload.offerId || "")) || offers[offers.length - 1];
+        if (target?.packet) {
+          openLevelOffer(actor, target).catch((err) => console.error("[wi-core-foundry] socket offer open failed", err));
+        } else {
+          scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] socket scan failed", err));
+        }
+        return;
+      }
+
+      if (payload.type === "level-offer-delivered" && game.user?.isGM) {
+        const actorName = String(payload.actorName || payload.actorId || "actor");
+        const userName = String(payload.userName || payload.userId || "player");
+        ui.notifications.info(`Packet delivered to ${userName} for ${actorName}.`);
+        const actor = game.actors.get(String(payload.actorId || ""));
+        if (actor?.isOwner) {
+          const offers = getOfferList(actor);
+          const idx = offers.findIndex((o) => String(o.offerId || "") === String(payload.offerId || ""));
+          if (idx >= 0) {
+            offers[idx] = {
+              ...offers[idx],
+              gmNotifiedAt: new Date().toISOString(),
+            };
+            setOfferList(actor, offers).catch(() => {});
+          }
+        }
+        return;
+      }
+
+      if (payload.type === "level-offer-action-request" && game.user?.isGM) {
+        const actor = game.actors.get(String(payload.actorId || ""));
+        if (!actor) return;
+        const offers = getOfferList(actor);
+        const offer = offers.find((o) => String(o.offerId || "") === String(payload.offerId || "")) || actor.getFlag(MODULE_ID, "levelOffer");
+        if (!offer?.packet) return;
+        const action = String(payload.action || "");
+        if (action === "accept") {
+          acceptLevelOffer(actor, offer, offer.packet)
+            .then(() => ui.notifications.info(`GM applied accepted packet for ${actor.name}.`))
+            .catch((err) => ui.notifications.error(String(err?.message || err)));
+          return;
+        }
+        if (action === "reject") {
+          rejectLevelOffer(actor, String(offer.offerId || ""), String(offer.packet?.packetType || ""))
+            .then(() => ui.notifications.warn(`GM recorded rejected packet for ${actor.name}.`))
+            .catch((err) => ui.notifications.error(String(err?.message || err)));
+        }
       }
     });
   });
 
   Hooks.on("updateActor", (actor, changed) => {
     const levelOfferChanged = foundry.utils.hasProperty(changed || {}, `flags.${MODULE_ID}.levelOffer`)
+      || foundry.utils.hasProperty(changed || {}, `flags.${MODULE_ID}.levelOffers`)
       || JSON.stringify(changed || {}).includes(`"flags":{"${MODULE_ID}":{"levelOffer"`);
     if (!levelOfferChanged) return;
-    const offer = actor.getFlag(MODULE_ID, "levelOffer");
-    if (offer && actor.isOwner) {
+    const offers = getOfferList(actor);
+    const me = String(game.user?.id || "");
+    for (const offer of offers) {
+      if (!offer?.packet) continue;
+      if (String(offer.status || "open") !== "open") continue;
+      if (!offerTargetsUser(offer, me)) continue;
       openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] offer open failed", err));
     }
   });
@@ -411,13 +608,18 @@ export function registerPlayerProgression() {
       button.disabled = true;
       try {
         const actor = game.actors.get(actorId);
-        if (!actor || !actor.isOwner) {
-          ui.notifications.warn("You do not have permission to accept this packet.");
+        if (!actor) {
+          ui.notifications.warn("Actor not found.");
           button.disabled = false;
           return;
         }
-        const live = actor.getFlag(MODULE_ID, "levelOffer");
-        const liveOffer = live && String(live.offerId || "") === offerId ? live : { offerId, packet };
+        const offers = getOfferList(actor);
+        const liveOffer = offers.find((o) => String(o.offerId || "") === offerId) || { offerId, packet };
+        if (!actor.isOwner && !game.user?.isGM) {
+          await requestOfferActionFromGm(actor.id, offerId, liveOffer?.packet || packet || {}, "accept");
+          ui.notifications.info(`Acceptance sent to GM for ${actor.name}`);
+          return;
+        }
         await acceptLevelOffer(actor, liveOffer, liveOffer?.packet || packet || {});
         ui.notifications.info(`Accepted level packet for ${actor.name}`);
       } catch (err) {
@@ -431,9 +633,14 @@ export function registerPlayerProgression() {
       button.disabled = true;
       try {
         const actor = game.actors.get(actorId);
-        if (!actor || !actor.isOwner) {
-          ui.notifications.warn("You do not have permission to reject this packet.");
+        if (!actor) {
+          ui.notifications.warn("Actor not found.");
           button.disabled = false;
+          return;
+        }
+        if (!actor.isOwner && !game.user?.isGM) {
+          await requestOfferActionFromGm(actor.id, offerId, packet || {}, "reject");
+          ui.notifications.warn(`Rejection sent to GM for ${actor.name}`);
           return;
         }
         const pType = String(packet?.packetType || "");
