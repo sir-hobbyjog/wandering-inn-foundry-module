@@ -544,11 +544,16 @@ ${historyRows}
       this.render();
     });
 
-    html.on("click", "[data-action]", async (ev) => {
-      const el = ev.currentTarget;
+    const root = html?.[0];
+    if (!root) return;
+    root.addEventListener("click", async (ev) => {
+      const target = ev.target;
+      if (!(target instanceof Element)) return;
+      const el = target.closest("[data-action]");
+      if (!el || !root.contains(el)) return;
       const action = String(el.dataset.action || "");
       const actorId = String(el.dataset.actorId || "");
-      const isButton = ev.target?.closest?.("button");
+      const isButton = target.closest("button");
       if (isButton) ev.stopPropagation();
 
       if (action === "select-actor") {
