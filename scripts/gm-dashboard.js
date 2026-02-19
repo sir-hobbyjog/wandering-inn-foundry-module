@@ -526,35 +526,35 @@ ${historyRows}
 
   activateListeners(html) {
     super.activateListeners(html);
+    const $root = this.element;
+    if (!$root || !$root.length) return;
 
-    html.find("#wi-roster-search").on("input", (ev) => {
+    // Clear prior delegated handlers to avoid duplicates across renders.
+    $root.off(".wicoregm");
+
+    $root.on("input.wicoregm", "#wi-roster-search", (ev) => {
       this.state.search = String(ev.currentTarget.value || "");
       this.render();
     });
-    html.find("#wi-roster-status").on("change", (ev) => {
+    $root.on("change.wicoregm", "#wi-roster-status", (ev) => {
       this.state.status = String(ev.currentTarget.value || "all");
       this.render();
     });
-    html.find("#wi-filter-multi").on("change", (ev) => {
+    $root.on("change.wicoregm", "#wi-filter-multi", (ev) => {
       this.state.filterMulticlass = !!ev.currentTarget.checked;
       this.render();
     });
-    html.find("#wi-filter-missing").on("change", (ev) => {
+    $root.on("change.wicoregm", "#wi-filter-missing", (ev) => {
       this.state.filterMissingChoices = !!ev.currentTarget.checked;
       this.render();
     });
 
-    const root = html?.[0];
-    if (!root) return;
-    root.addEventListener("click", async (ev) => {
-      const target = ev.target;
-      if (!(target instanceof Element)) return;
-      const el = target.closest("[data-action]");
-      if (!el || !root.contains(el)) return;
+    $root.on("click.wicoregm", "[data-action]", async (ev) => {
+      const el = ev.currentTarget;
       const action = String(el.dataset.action || "");
       const actorId = String(el.dataset.actorId || "");
-      const isButton = target.closest("button");
-      if (isButton) ev.stopPropagation();
+      const button = ev.target?.closest?.("button");
+      if (button) ev.stopPropagation();
 
       if (action === "select-actor") {
         this.state.selectedActorId = actorId;
@@ -572,8 +572,8 @@ ${historyRows}
       if (action === "quick-level") return this._onQuickLevel(actorId);
       if (action === "open-sheet") return this._onOpenSheet(actorId);
       if (action === "send-packet") return this._onSendPacket(actorId);
-      if (action === "stage-levelup") return this._onStageLevelUp(actorId, html);
-      if (action === "apply-levelup") return this._onApplyLevelUp(actorId, html);
+      if (action === "stage-levelup") return this._onStageLevelUp(actorId, $root);
+      if (action === "apply-levelup") return this._onApplyLevelUp(actorId, $root);
       if (action === "add-class") return this._onAddClass(actorId);
       if (action === "change-class") return this._onChangeClass(actorId);
       if (action === "merge-classes") return this._onMergeClasses(actorId);
