@@ -498,6 +498,41 @@ async function scanAndOpenOffers() {
   }
 }
 
+function messageTargetsUser(message, flag, userId) {
+  if (String(flag?.recipientUserId || "").trim()) {
+    return String(flag.recipientUserId) === String(userId || "");
+  }
+  const whisper = Array.isArray(message?.whisper) ? message.whisper.map((u) => String(u?.id || u)) : [];
+  if (!whisper.length) return true;
+  return whisper.includes(String(userId || ""));
+}
+
+async function scanChatOfferMessages() {
+  const me = String(game.user?.id || "");
+  if (!me) return;
+  const messages = (game.messages?.contents || []).slice().reverse();
+  for (const msg of messages) {
+    const flag = msg?.getFlag?.(MODULE_ID, "levelOfferChat");
+    if (!flag) continue;
+    if (!messageTargetsUser(msg, flag, me)) continue;
+    const actor = game.actors.get(String(flag.actorId || ""));
+    if (!actor) continue;
+    const offers = getOfferList(actor);
+    const offerId = String(flag.offerId || "");
+    const offer = offers.find((o) => String(o.offerId || "") === offerId)
+      || {
+        offerId,
+        packet: flag.packet || {},
+        targetUserIds: [me],
+        status: "open",
+      };
+    if (!offer?.packet) continue;
+    if (String(offer.status || "open") !== "open") continue;
+    if (!offerTargetsUser(offer, me)) continue;
+    openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] chat offer open failed", err));
+  }
+}
+
 async function notifyGmDeliveredOffers() {
   if (!game.user?.isGM) return;
   for (const actor of game.actors.contents) {
@@ -520,6 +555,7 @@ async function notifyGmDeliveredOffers() {
 export function registerPlayerProgression() {
   Hooks.once("ready", () => {
     scanAndOpenOffers().catch((err) => console.error("[wi-core-foundry] offer scan failed", err));
+    scanChatOfferMessages().catch((err) => console.error("[wi-core-foundry] chat offer scan failed", err));
     notifyGmDeliveredOffers().catch((err) => console.error("[wi-core-foundry] GM delivery notify scan failed", err));
     game.socket?.on(`module.${MODULE_ID}`, (payload) => {
       if (!payload) return;
@@ -651,5 +687,24 @@ export function registerPlayerProgression() {
         button.disabled = false;
       }
     });
+  });
+
+  Hooks.on("createChatMessage", (message) => {
+    const flag = message?.getFlag?.(MODULE_ID, "levelOfferChat");
+    if (!flag) return;
+    const me = String(game.user?.id || "");
+    if (!messageTargetsUser(message, flag, me)) return;
+    const actor = game.actors.get(String(flag.actorId || ""));
+    if (!actor) return;
+    const offers = getOfferList(actor);
+    const offer = offers.find((o) => String(o.offerId || "") === String(flag.offerId || ""))
+      || {
+        offerId: String(flag.offerId || ""),
+        packet: flag.packet || {},
+        targetUserIds: [me],
+        status: "open",
+      };
+    if (!offer?.packet) return;
+    openLevelOffer(actor, offer).catch((err) => console.error("[wi-core-foundry] create chat offer open failed", err));
   });
 }

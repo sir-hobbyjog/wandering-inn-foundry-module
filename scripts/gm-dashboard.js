@@ -104,6 +104,23 @@ function parseCsvList(raw) {
     .filter(Boolean);
 }
 
+function getActorOffers(actor) {
+  const list = Array.isArray(actor?.getFlag?.(MODULE_ID, "levelOffers")) ? actor.getFlag(MODULE_ID, "levelOffers") : [];
+  const legacy = actor?.getFlag?.(MODULE_ID, "levelOffer");
+  const merged = [...list];
+  if (legacy?.offerId && !merged.some((o) => String(o?.offerId || "") === String(legacy.offerId))) {
+    merged.push(legacy);
+  }
+  const byId = new Map();
+  for (const row of merged) {
+    if (!row || !row.packet) continue;
+    const id = String(row.offerId || "");
+    if (!id) continue;
+    byId.set(id, row);
+  }
+  return [...byId.values()];
+}
+
 async function mutateProgression(actor, fn) {
   const current = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
   const next = foundry.utils.deepClone(current);
@@ -489,6 +506,116 @@ class WICoreGMDashboard extends Application {
     }).get();
   }
 
+  async _promptPacketRecipients(actor, defaultUserIds = []) {
+    const players = game.users.filter((u) => !u.isGM);
+    if (!players.length) return [];
+    const checked = new Set((defaultUserIds || []).map((x) => String(x)));
+    const rows = players.map((u) => {
+      const uid = String(u.id || "");
+      const isChecked = checked.has(uid) ? "checked" : "";
+      const suffix = u.active ? "" : " (offline)";
+      return `<label><input type="checkbox" class="wi-packet-recipient" value="${escapeHtml(uid)}" ${isChecked}/> ${escapeHtml(String(u.name || uid))}${suffix}</label>`;
+    }).join("<br/>");
+    return new Promise((resolve) => {
+      new Dialog({
+        title: `Select Packet Recipients: ${actor.name}`,
+        content: `<div>${rows || "No players found."}</div>`,
+        buttons: {
+          send: {
+            label: "Use Selected",
+            callback: (html) => {
+              const ids = html.find(".wi-packet-recipient:checked").map((_, el) => String(el.value || "")).get();
+              resolve(ids);
+            }
+          },
+          cancel: { label: "Cancel", callback: () => resolve([]) }
+        },
+        default: "send",
+        close: () => resolve([])
+      }).render(true);
+    });
+  }
+
+  async _resolvePacketRecipients(actor, existingUserIds = []) {
+    const linkedCharacterUsers = game.users.filter((u) => !u.isGM && String(u.character?.id || "") === actor.id);
+    const permissionUsers = game.users.filter((u) => {
+      if (u.isGM) return false;
+      return actor.testUserPermission(u, "OWNER")
+        || actor.testUserPermission(u, "OBSERVER")
+        || actor.testUserPermission(u, "LIMITED");
+    });
+    const preselected = [
+      ...existingUserIds.map((x) => String(x)),
+      ...linkedCharacterUsers.map((u) => String(u.id || "")),
+      ...permissionUsers.map((u) => String(u.id || "")),
+    ].filter(Boolean);
+    const dedup = [...new Set(preselected)];
+    if (dedup.length) return dedup;
+    return this._promptPacketRecipients(actor, dedup);
+  }
+
+  async _storeOffer(actor, offer) {
+    const all = getActorOffers(actor).filter((o) => String(o.offerId || "") !== String(offer.offerId || ""));
+    all.push(offer);
+    const open = all.find((o) => String(o.status || "open") === "open") || null;
+    await actor.setFlag(MODULE_ID, "levelOffers", all);
+    await actor.setFlag(MODULE_ID, "levelOffer", open);
+  }
+
+  async _removeOffer(actor, offerId) {
+    const next = getActorOffers(actor).filter((o) => String(o.offerId || "") !== String(offerId || ""));
+    const open = next.find((o) => String(o.status || "open") === "open") || null;
+    await actor.setFlag(MODULE_ID, "levelOffers", next);
+    await actor.setFlag(MODULE_ID, "levelOffer", open);
+    return next;
+  }
+
+  async _dispatchOffer(actor, offer, userIds, isResend = false) {
+    const packet = offer.packet || {};
+    const skillLines = (packet.skillPicks || [])
+      .map((s) => `<li><strong>${escapeHtml(s.name || s.skillId || "Skill")}</strong>: ${escapeHtml(s.description || "")}</li>`)
+      .join("");
+    for (const uid of userIds) {
+      const content = `<div class="wi-level-offer-chat">
+<p><strong>Level Packet Ready:</strong> ${escapeHtml(actor.name)}</p>
+<p>Type: ${escapeHtml(packet.packetType || "standard")}</p>
+<p>Delta: +${Number(packet.deltaLevels || 1)} to ${escapeHtml(packet.classId || "primary")}</p>
+<details><summary>Skill Picks</summary><ul>${skillLines || "<li>No skill picks</li>"}</ul></details>
+<div class="wi-tab-actions">
+  <button type="button" data-action="offer-accept" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Accept</button>
+  <button type="button" data-action="offer-reject" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Reject</button>
+</div>
+</div>`;
+      await ChatMessage.create({
+        content,
+        speaker: { alias: "GM Progression Packet" },
+        whisper: [String(uid)],
+        flags: {
+          [MODULE_ID]: {
+            levelOfferChat: {
+              actorId: actor.id,
+              offerId: offer.offerId,
+              packet,
+              recipientUserId: String(uid),
+            }
+          }
+        }
+      });
+    }
+    try {
+      game.socket?.emit(`module.${MODULE_ID}`, {
+        type: "level-offer-notify",
+        actorId: actor.id,
+        offerId: offer.offerId,
+        userIds: userIds.map((x) => String(x)),
+      });
+    } catch (_err) {
+      // no-op
+    }
+    const action = isResend ? "Re-sent" : "Sent";
+    ui.notifications.info(`${action} packet for ${actor.name} to ${userIds.length} player(s).`);
+  }
+
   async _generateSkillSuggestions(actor, classId, deltaLevels) {
     const progression = actor.getFlag(MODULE_ID, "progression") || buildProgressionFromActor(actor);
     const meta = ensureDashboardMeta(actor);
@@ -634,6 +761,26 @@ class WICoreGMDashboard extends Application {
     const pending = rows.filter((r) => r.pendingChoices || r.stagedPacket);
     const validationIssues = rows.filter((r) => r.pendingChoices || r.needsReview || ((r.progression.classes || []).length && (r.progression.classes || []).filter((c) => c.isPrimary).length !== 1));
     const highlights = activityTagCounts(rows);
+    const packetQueue = [];
+    for (const r of rows) {
+      const offers = getActorOffers(r.actor) || [];
+      for (const offer of offers) {
+        if (!offer?.packet) continue;
+        if (String(offer.status || "open") !== "open") continue;
+        const targets = (offer.targetUserIds || []).map((id) => game.users.get(String(id))?.name || String(id));
+        packetQueue.push({
+          actorId: r.actorId,
+          actorName: r.name,
+          offerId: String(offer.offerId || ""),
+          packetType: String(offer.packet?.packetType || "standard"),
+          deltaLevels: Number(offer.packet?.deltaLevels || 1),
+          classId: String(offer.packet?.classId || "primary"),
+          createdAt: String(offer.createdAt || ""),
+          targetNames: targets,
+          deliveredCount: Array.isArray(offer.deliveredToUserIds) ? offer.deliveredToUserIds.length : 0,
+        });
+      }
+    }
 
     let sessionMarks = [];
     try {
@@ -658,6 +805,7 @@ class WICoreGMDashboard extends Application {
       history,
       xpEvents,
       pending,
+      packetQueue,
       validationIssues,
       highlights,
       playerRequests,
@@ -799,6 +947,13 @@ ${historyRows}
     }[data.activeTab] || overview;
 
     const pendingRows = data.pending.map((r) => `<li><strong>${escapeHtml(r.name)}</strong>: pending level-up choices</li>`).join("") || "<li>No pending level-up packets.</li>";
+    const packetRows = (data.packetQueue || []).map((p) => `
+<li>
+  <strong>${escapeHtml(p.actorName)}</strong> [${escapeHtml(p.packetType)} +${Number(p.deltaLevels || 1)} ${escapeHtml(p.classId)}]
+  <div class="wi-mini">to: ${escapeHtml((p.targetNames || []).join(", ") || "unknown")} | delivered: ${Number(p.deliveredCount || 0)} | ${escapeHtml(formatDateIso(p.createdAt))}</div>
+  <button type="button" data-action="packet-resend" data-actor-id="${escapeHtml(p.actorId)}" data-offer-id="${escapeHtml(p.offerId)}">Resend</button>
+  <button type="button" data-action="packet-clear" data-actor-id="${escapeHtml(p.actorId)}" data-offer-id="${escapeHtml(p.offerId)}">Clear</button>
+</li>`).join("") || "<li>No active packet queue.</li>";
     const issueRows = data.validationIssues.map((r) => `<li><strong>${escapeHtml(r.name)}</strong>: ${escapeHtml(r.status)}</li>`).join("") || "<li>No validation issues.</li>";
     const highlightRows = data.highlights.map(([tag, count]) => `<li>${escapeHtml(tag)} (${count})</li>`).join("") || "<li>No highlights yet.</li>";
     const requestRows = (data.playerRequests || []).slice(0, 20).map((r) => `<li><strong>${escapeHtml(r.request_type)}</strong> ${escapeHtml(r.actor_id)} [${escapeHtml(r.status)}] <button type=\"button\" data-action=\"request-status\" data-request-id=\"${escapeHtml(r.request_id)}\" data-request-status=\"resolved\">Resolve</button></li>`).join("") || "<li>No player requests.</li>";
@@ -833,6 +988,8 @@ ${historyRows}
     <h3>Queue & Notifications</h3>
     <h4>Pending Level-Ups</h4>
     <ul>${pendingRows}</ul>
+    <h4>Packet Queue</h4>
+    <ul>${packetRows}</ul>
     <h4>Validation Issues</h4>
     <ul>${issueRows}</ul>
     <h4>Player Requests</h4>
@@ -918,6 +1075,8 @@ ${historyRows}
       if (action === "quick-level") return this._onQuickLevel(actorId);
       if (action === "open-sheet") return this._onOpenSheet(actorId);
       if (action === "send-packet") return this._onSendPacket(actorId);
+      if (action === "packet-resend") return this._onResendPacket(actorId, String(el.dataset.offerId || ""));
+      if (action === "packet-clear") return this._onClearPacket(actorId, String(el.dataset.offerId || ""));
       if (action === "edit-species") return this._onEditSpecies(actorId);
       if (action === "generate-skills") return this._onGenerateSkills(actorId, $root);
       if (action === "add-custom-skill") return this._onAddCustomSkill(actorId);
@@ -1148,85 +1307,72 @@ ${historyRows}
     const offer = {
       offerId: foundry.utils.randomID(),
       createdAt: new Date().toISOString(),
-      packet
+      packet,
+      status: "open",
     };
-    const linkedCharacterUsers = game.users.filter((u) => !u.isGM && String(u.character?.id || "") === actor.id);
-    const ownerUsers = game.users.filter((u) => actor.testUserPermission(u, "OWNER"));
-    const nonGmOwners = ownerUsers.filter((u) => !u.isGM);
-    const nonGmObservers = game.users.filter((u) => !u.isGM && actor.testUserPermission(u, "OBSERVER"));
-
-    let targetUsers = linkedCharacterUsers.length ? linkedCharacterUsers : nonGmOwners;
-    if (!targetUsers.length) targetUsers = nonGmObservers;
-    if (!targetUsers.length) {
-      const allNonGm = game.users.filter((u) => !u.isGM);
-      if (allNonGm.length === 1) targetUsers = allNonGm;
+    const targetUserIds = await this._resolvePacketRecipients(actor, []);
+    if (!targetUserIds.length) {
+      ui.notifications.warn(`No player recipient selected for ${actor.name}.`);
+      return;
     }
-    if (!targetUsers.length) targetUsers = ownerUsers.length ? ownerUsers : [game.user];
-
-    const targetUserIds = [...new Set(targetUsers.map((u) => String(u.id || "")).filter(Boolean))];
-    const offlineUserIds = targetUsers
-      .filter((u) => !u.active)
-      .map((u) => String(u.id || ""))
-      .filter(Boolean);
-    const offlineNames = targetUsers.filter((u) => !u.active).map((u) => String(u.name || u.id || ""));
-    offer.targetUserIds = targetUserIds;
+    offer.targetUserIds = targetUserIds.map((x) => String(x));
     offer.deliveredToUserIds = [];
-    offer.status = "open";
-
-    const skillLines = (packet.skillPicks || [])
-      .map((s) => `<li><strong>${escapeHtml(s.name || s.skillId || "Skill")}</strong>: ${escapeHtml(s.description || "")}</li>`)
-      .join("");
-    const content = `<div class="wi-level-offer-chat">
-<p><strong>Level Packet Ready:</strong> ${escapeHtml(actor.name)}</p>
-<p>Type: ${escapeHtml(packet.packetType || "standard")}</p>
-<p>Delta: +${Number(packet.deltaLevels || 1)} to ${escapeHtml(packet.classId || "primary")}</p>
-<details><summary>Skill Picks</summary><ul>${skillLines || "<li>No skill picks</li>"}</ul></details>
-<div class="wi-tab-actions">
-  <button type="button" data-action="offer-accept" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Accept</button>
-  <button type="button" data-action="offer-reject" data-actor-id="${actor.id}" data-offer-id="${offer.offerId}">Reject</button>
-</div>
-</div>`;
-    await ChatMessage.create({
-      content,
-      speaker: { alias: "GM Progression Packet" },
-      whisper: targetUserIds,
-      flags: {
-        [MODULE_ID]: {
-          levelOfferChat: {
-            actorId: actor.id,
-            offerId: offer.offerId,
-            packet
-          }
-        }
-      }
-    });
-    const existingOffers = Array.isArray(actor.getFlag(MODULE_ID, "levelOffers"))
-      ? actor.getFlag(MODULE_ID, "levelOffers")
-      : [];
-    const nextOffers = [...existingOffers.filter((o) => o && String(o.offerId || "") !== offer.offerId), offer];
-    await actor.setFlag(MODULE_ID, "levelOffers", nextOffers);
-    await actor.setFlag(MODULE_ID, "levelOffer", offer);
-    try {
-      game.socket?.emit(`module.${MODULE_ID}`, {
-        type: "level-offer-notify",
-        actorId: actor.id,
-        offerId: offer.offerId,
-        userIds: targetUserIds,
-        offlineUserIds
-      });
-    } catch (_err) {
-      // no-op: flag update remains the primary transport
-    }
+    await this._storeOffer(actor, offer);
+    await this._dispatchOffer(actor, offer, targetUserIds, false);
     await actor.setFlag(MODULE_ID, "dashboard", {
       ...meta,
       stagedPacket: { ...packet, sentAt: new Date().toISOString() }
     });
-    if (targetUserIds.length === 0) {
-      ui.notifications.warn(`No player recipient resolved for ${actor.name}.`);
-    } else if (offlineUserIds.length) {
-      ui.notifications.warn(`Packet queued for offline player(s): ${offlineNames.join(", ")}. It will open on next login.`);
+    const offlineUsers = targetUserIds.map((id) => game.users.get(id)).filter((u) => u && !u.active);
+    if (offlineUsers.length) {
+      const names = offlineUsers.map((u) => String(u.name || u.id || "")).join(", ");
+      ui.notifications.warn(`Packet queued for offline player(s): ${names}. It will show on next login.`);
     }
-    ui.notifications.info(`Sent staged packet for ${actor.name}`);
+    this.render();
+  }
+
+  async _onResendPacket(actorId, offerId) {
+    const actor = game.actors.get(actorId);
+    if (!actor || !offerId) return;
+    const offers = getActorOffers(actor);
+    const idx = offers.findIndex((o) => String(o.offerId || "") === String(offerId));
+    if (idx < 0) {
+      ui.notifications.warn("Packet offer not found.");
+      return;
+    }
+    const offer = foundry.utils.deepClone(offers[idx]);
+    const recipients = await this._resolvePacketRecipients(actor, offer.targetUserIds || []);
+    if (!recipients.length) {
+      ui.notifications.warn("No recipients selected.");
+      return;
+    }
+    offer.targetUserIds = recipients.map((x) => String(x));
+    offer.lastResentAt = new Date().toISOString();
+    offer.status = String(offer.status || "open");
+    offers[idx] = offer;
+    await actor.setFlag(MODULE_ID, "levelOffers", offers);
+    await actor.setFlag(MODULE_ID, "levelOffer", offers.find((o) => String(o.status || "open") === "open") || null);
+    await this._dispatchOffer(actor, offer, recipients, true);
+    this.render();
+  }
+
+  async _onClearPacket(actorId, offerId) {
+    const actor = game.actors.get(actorId);
+    if (!actor || !offerId) return;
+    await this._removeOffer(actor, offerId);
+    const remaining = getActorOffers(actor);
+    const meta = ensureDashboardMeta(actor);
+    await actor.setFlag(MODULE_ID, "dashboard", {
+      ...meta,
+      stagedPacket: null,
+      pendingChoices: remaining.length > 0 ? true : false,
+    });
+    if (!remaining.length) {
+      await upsertProgressionMeta(actor, { pendingChoices: false }, await resolveSessionId());
+    } else {
+      await upsertProgressionMeta(actor, { pendingChoices: true }, await resolveSessionId());
+    }
+    ui.notifications.info(`Cleared pending packet ${offerId} for ${actor.name}.`);
     this.render();
   }
 
