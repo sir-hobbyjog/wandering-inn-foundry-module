@@ -2,6 +2,7 @@ import { apiRequest } from "./api-client.js";
 import { registerActorSyncHook } from "./actor-sync.js";
 import { registerNpcPanel } from "./chat-ui.js";
 import { registerDmConsole } from "./dm-console.js";
+import { registerProgressionTools } from "./progression.js";
 
 const MODULE_ID = "wi-core-foundry";
 
@@ -93,6 +94,41 @@ function registerSettings() {
     type: String,
     default: ""
   });
+  game.settings.register(MODULE_ID, "levelPath", {
+    name: "Actor Level Path",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+  game.settings.register(MODULE_ID, "xpPath", {
+    name: "Actor XP Path",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+  game.settings.register(MODULE_ID, "classPath", {
+    name: "Actor Classes Path",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+  game.settings.register(MODULE_ID, "speciesPath", {
+    name: "Actor Species Path",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+  game.settings.register(MODULE_ID, "skillPath", {
+    name: "Actor Skills Path",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
 }
 
 function registerKeybindings() {
@@ -138,6 +174,17 @@ function registerKeybindings() {
       return true;
     }
   });
+
+  game.keybindings.register(MODULE_ID, "openProgressionEditor", {
+    name: "Open Progression Editor",
+    hint: "GM-only shortcut: open progression editor for selected token actor.",
+    restricted: true,
+    editable: [{ key: "KeyL", modifiers: ["Shift", "Alt"] }],
+    onDown: () => {
+      game.wiCore.openProgressionEditor().catch((err) => console.error("[wi-core-foundry] progression editor hotkey failed", err));
+      return true;
+    }
+  });
 }
 
 function registerSceneControlButton() {
@@ -146,18 +193,32 @@ function registerSceneControlButton() {
     const tokenControls = controls.find((c) => c.name === "token");
     if (!tokenControls) return;
     const alreadyPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenDmConsole");
-    if (alreadyPresent) return;
+    const progressionPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenProgressionEditor");
+    if (!alreadyPresent) {
+      tokenControls.tools.push({
+        name: "wiCoreOpenDmConsole",
+        title: "Open WI DM Console",
+        icon: "fas fa-scroll",
+        button: true,
+        visible: true,
+        onClick: () => {
+          game.wiCore.openDmConsole().catch((err) => console.error("[wi-core-foundry] scene control DM console failed", err));
+        }
+      });
+    }
 
-    tokenControls.tools.push({
-      name: "wiCoreOpenDmConsole",
-      title: "Open WI DM Console",
-      icon: "fas fa-scroll",
-      button: true,
-      visible: true,
-      onClick: () => {
-        game.wiCore.openDmConsole().catch((err) => console.error("[wi-core-foundry] scene control DM console failed", err));
-      }
-    });
+    if (!progressionPresent) {
+      tokenControls.tools.push({
+        name: "wiCoreOpenProgressionEditor",
+        title: "Open WI Progression Editor",
+        icon: "fas fa-user-cog",
+        button: true,
+        visible: true,
+        onClick: () => {
+          game.wiCore.openProgressionEditor().catch((err) => console.error("[wi-core-foundry] scene control progression editor failed", err));
+        }
+      });
+    }
   });
 }
 
@@ -165,6 +226,7 @@ Hooks.once("init", () => {
   registerSettings();
   registerNpcPanel();
   registerDmConsole();
+  registerProgressionTools();
   registerKeybindings();
   registerSceneControlButton();
 });
@@ -182,5 +244,6 @@ Hooks.once("ready", async () => {
   game.wiCore = game.wiCore || {};
   game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
   game.wiCore.openDmConsole = game.wiCore.openDmConsole || (async () => {});
+  game.wiCore.openProgressionEditor = game.wiCore.openProgressionEditor || (async () => {});
   game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
 });

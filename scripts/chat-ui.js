@@ -1,18 +1,53 @@
 import { apiRequest } from "./api-client.js";
 import { resolveSessionId } from "./session.js";
 import { maybePlayVoice } from "./voice.js";
-import { bindActorToNpc, pullCombatToActor } from "./actor-sync.js";
+import { bindActorToNpc, bindActorToPreset, pullCombatToActor } from "./actor-sync.js";
 
 const MODULE_ID = "wi-core-foundry";
+let presetCache = [];
 
 function actorOptionsHtml() {
   const actors = game.actors?.contents || [];
   return actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("\n");
 }
 
+async function ensurePresetCache() {
+  if (presetCache.length) return presetCache;
+  try {
+    const out = await apiRequest("/foundry/npc/presets");
+    presetCache = Array.isArray(out.presets) ? out.presets : [];
+  } catch (_err) {
+    presetCache = [];
+  }
+  return presetCache;
+}
+
+function presetOptionsHtml(selectedPresetId = "") {
+  const options = [`<option value="">-- Select Core NPC Preset --</option>`];
+  for (const p of presetCache) {
+    const selected = String(p.preset_id) === String(selectedPresetId || "") ? "selected" : "";
+    const label = `${p.preset_id} (${p.npc_id})`;
+    options.push(`<option value="${p.preset_id}" ${selected}>${label}</option>`);
+  }
+  return options.join("\\n");
+}
+
+function applyPresetToState(state, presetId) {
+  const p = presetCache.find((x) => String(x.preset_id) === String(presetId || ""));
+  if (!p) return state;
+  return {
+    ...state,
+    presetId: String(p.preset_id || ""),
+    npcId: String(p.npc_id || state.npcId || ""),
+    archetypeId: String(p.archetype_id || state.archetypeId || "innkeeper_npc"),
+    level: Number(p.default_level || state.level || 10)
+  };
+}
+
 function panelStateFromHtml(html) {
   return {
     actorId: String(html.find("#wi-actor").val() || ""),
+    presetId: String(html.find("#wi-preset").val() || ""),
     npcId: String(html.find("#wi-npc-id").val() || ""),
     archetypeId: String(html.find("#wi-arch").val() || "innkeeper_npc"),
     level: Number(html.find("#wi-level").val() || 10),
@@ -33,6 +68,7 @@ function renderNpcPanel(state) {
   const content = `
 <div class="wi-core-grid">
   <label>Actor</label><select id="wi-actor">${actorOptionsHtml()}</select>
+  <label>Core Preset</label><select id="wi-preset">${presetOptionsHtml(state.presetId)}</select>
   <label>NPC ID</label><input id="wi-npc-id" type="text" placeholder="erin_solstice_early" value="${state.npcId}" />
   <label>Archetype</label><input id="wi-arch" type="text" value="${state.archetypeId}" />
   <label>Level</label><input id="wi-level" type="number" value="${state.level}" />
@@ -47,6 +83,15 @@ function renderNpcPanel(state) {
         const next = panelStateFromHtml(html);
         const actor = game.actors.get(String(html.find("#wi-actor").val() || ""));
         if (!actor) return;
+        if (next.presetId) {
+          const bound = await bindActorToPreset(actor, next.presetId);
+          next.npcId = String(bound.npc_id || next.npcId || "");
+          next.archetypeId = String(bound.archetype_id || next.archetypeId || "innkeeper_npc");
+          next.level = Number(bound.default_level || next.level || 10);
+          ui.notifications.info(`Actor bound using preset ${next.presetId}`);
+          renderNpcPanel(next);
+          return;
+        }
         await bindActorToNpc(actor, {
           npcId: html.find("#wi-npc-id").val(),
           archetypeId: html.find("#wi-arch").val(),
@@ -79,6 +124,12 @@ function renderNpcPanel(state) {
         const sessionId = await resolveSessionId();
         const voiceId = String(game.settings.get(MODULE_ID, "defaultVoiceId") || "").trim();
         const debugMode = Boolean(next.debugMode && game.user?.isGM);
+        const actor = game.actors.get(String(next.actorId || ""));
+        const progression = actor?.getFlag(MODULE_ID, "progression") || {};
+        const actorSpecies = progression?.species?.primary ? [String(progression.species.primary)] : [];
+        const actorClasses = Array.isArray(progression?.classes)
+          ? progression.classes.map((c) => String(c.classId || "").trim()).filter(Boolean)
+          : [];
         const response = await apiRequest("/npc/respond", {
           method: "POST",
           body: {
@@ -92,8 +143,11 @@ function renderNpcPanel(state) {
             debug_mode: debugMode,
             policy_mode: "strict",
             response_style: "in_character",
-            party_species: [],
+            party_species: actorSpecies,
             party_subject_ids: [],
+            foundry_world_id: game.world?.id || "",
+            foundry_actor_id: actor?.id || "",
+            dm_override: actorClasses.length ? `Actor class tags: ${actorClasses.join(", ")}` : "",
             voice_requested: !!voiceId,
             voice_id: voiceId,
             include_combat_profile: false
@@ -149,6 +203,11 @@ function renderNpcPanel(state) {
     content,
     render: (html) => {
       if (state.actorId) html.find("#wi-actor").val(state.actorId);
+      html.find("#wi-preset").on("change", () => {
+        const current = panelStateFromHtml(html);
+        const next = applyPresetToState(current, html.find("#wi-preset").val());
+        renderNpcPanel(next);
+      });
     },
     buttons,
     default: "send"
@@ -157,9 +216,11 @@ function renderNpcPanel(state) {
 
 export function registerNpcPanel() {
   game.wiCore = game.wiCore || {};
-  game.wiCore.openNpcPanel = (initial = {}) => {
+  game.wiCore.openNpcPanel = async (initial = {}) => {
+    await ensurePresetCache();
     const state = {
       actorId: String(initial.actorId || ""),
+      presetId: String(initial.presetId || ""),
       npcId: String(initial.npcId || ""),
       archetypeId: String(initial.archetypeId || "innkeeper_npc"),
       level: Number(initial.level || 10),
@@ -167,7 +228,7 @@ export function registerNpcPanel() {
       debugMode: Boolean(initial.debugMode || game.settings.get(MODULE_ID, "gmDebugMode") || false),
       lastTraceId: String(initial.lastTraceId || game.wiCore?.lastDebugTraceId || "")
     };
-    renderNpcPanel(state);
+    renderNpcPanel(applyPresetToState(state, state.presetId));
   };
 
   game.wiCore.pullCombatSelected = async () => {

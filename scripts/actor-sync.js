@@ -1,5 +1,6 @@
 import { apiRequest } from "./api-client.js";
 import { resolveSessionId } from "./session.js";
+import { buildProgressionFromActor, shouldSyncProgressionChange } from "./progression.js";
 
 const MODULE_ID = "wi-core-foundry";
 const pushTimers = new Map();
@@ -36,7 +37,65 @@ export async function bindActorToNpc(actor, payload) {
   });
 }
 
-export async function pullCombatToActor(actor, { levelOverride = 0, forceRegenerate = false } = {}) {
+export async function bindActorToPreset(actor, presetId) {
+  return apiRequest("/foundry/actor/bind/preset", {
+    method: "POST",
+    body: {
+      world_id: game.world.id,
+      actor_id: actor.id,
+      preset_id: String(presetId || "").trim()
+    }
+  });
+}
+
+export async function syncActorProgression(actor) {
+  const sessionId = await resolveSessionId();
+  const progression = buildProgressionFromActor(actor);
+  const out = await apiRequest("/foundry/actor/progression/sync", {
+    method: "POST",
+    body: {
+      world_id: game.world.id,
+      actor_id: actor.id,
+      session_id: sessionId,
+      progression
+    }
+  });
+
+  const update = {
+    [`flags.${MODULE_ID}.progression`]: {
+      ...out.progression,
+      audit: {
+        lastSyncAt: new Date().toISOString(),
+        lastSyncBy: game.user?.id || "",
+        lastBackendHash: out.source_hash || ""
+      }
+    },
+    [`flags.${MODULE_ID}.resistances`]: out.progression?.resistances || {},
+    [`flags.${MODULE_ID}.hpMax`]: Number(out.progression?.derived?.hpMax || 1),
+    [`flags.${MODULE_ID}.ac`]: Number(out.progression?.derived?.ac || 1)
+  };
+
+  const hpMaxPath = actorPath("hpMaxPath", "");
+  const hpValuePath = actorPath("hpValuePath", "");
+  const acPath = actorPath("acPath", "");
+  const levelPath = actorPath("levelPath", "");
+  const xpPath = actorPath("xpPath", "");
+
+  writeNested(update, hpMaxPath, Number(out.progression?.derived?.hpMax || 1));
+  writeNested(update, acPath, Number(out.progression?.derived?.ac || 1));
+  writeNested(update, levelPath, Number(out.progression?.level || 1));
+  writeNested(update, xpPath, Number(out.progression?.xp || 0));
+
+  if (hpValuePath) {
+    const current = readNested(actor.toObject(), hpValuePath);
+    writeNested(update, hpValuePath, current ?? Number(out.progression?.derived?.hpMax || 1));
+  }
+
+  await actor.update(update);
+  return out;
+}
+
+export async function pullCombatToActor(actor, { levelOverride = 0, forceRegenerate = false, useProgression = true } = {}) {
   const sessionId = await resolveSessionId();
   const out = await apiRequest("/foundry/combat/pull", {
     method: "POST",
@@ -45,7 +104,8 @@ export async function pullCombatToActor(actor, { levelOverride = 0, forceRegener
       actor_id: actor.id,
       session_id: sessionId,
       level_override: Number(levelOverride || 0),
-      force_regenerate: !!forceRegenerate
+      force_regenerate: !!forceRegenerate,
+      use_progression: !!useProgression
     }
   });
 
@@ -98,14 +158,29 @@ async function pushActorState(actor) {
 }
 
 export function registerActorSyncHook() {
-  Hooks.on("updateActor", (actor) => {
+  Hooks.on("updateActor", (actor, changed) => {
     if (!actor?.id) return;
     const existing = pushTimers.get(actor.id);
     if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => {
+
+    const timer = setTimeout(async () => {
+      try {
+        if (shouldSyncProgressionChange(changed)) {
+          await syncActorProgression(actor);
+        }
+      } catch (err) {
+        console.error("[wi-core-foundry] progression sync failed", err);
+        const retry = {
+          queuedAt: new Date().toISOString(),
+          reason: String(err?.message || err)
+        };
+        actor.setFlag(MODULE_ID, "progressionRetry", retry).catch(() => {});
+      }
+
       pushActorState(actor).catch((err) => console.error("[wi-core-foundry] push failed", err));
       pushTimers.delete(actor.id);
     }, debounceMs());
+
     pushTimers.set(actor.id, timer);
   });
 }

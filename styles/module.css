@@ -32,3 +32,14 @@
   background: rgba(0, 0, 0, 0.04);
   padding: 8px;
 }
+
+.wi-prog-grid {
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+.wi-prog-grid textarea {
+  min-height: 90px;
+}
