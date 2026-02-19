@@ -43,3 +43,199 @@
 .wi-prog-grid textarea {
   min-height: 90px;
 }
+
+.wi-gm-dashboard {
+  display: grid;
+  grid-template-columns: minmax(320px, 28%) minmax(520px, 48%) minmax(260px, 24%);
+  gap: 10px;
+  height: 100%;
+}
+
+.wi-pane {
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.85);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.wi-pane h3,
+.wi-pane h4 {
+  margin: 6px 0;
+}
+
+.wi-pane-head {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.wi-bulk-actions,
+.wi-tab-actions,
+.wi-quick-actions,
+.wi-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.wi-tabs button.is-active {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.wi-roster-list {
+  overflow: auto;
+  padding-right: 3px;
+}
+
+.wi-roster-card {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+.wi-roster-card.is-selected {
+  border-color: #3d5a80;
+  box-shadow: 0 0 0 1px #3d5a80 inset;
+}
+
+.wi-avatar {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.wi-roster-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wi-status {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.wi-row-sub {
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.wi-roster-xp {
+  display: grid;
+  gap: 2px;
+}
+
+.wi-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+
+.wi-bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #98c1d9, #3d5a80);
+}
+
+.wi-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+.wi-chip {
+  display: inline-block;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+.wi-chip-muted {
+  opacity: 0.7;
+}
+
+.wi-middle-body {
+  overflow: auto;
+}
+
+.wi-overview-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.wi-overview-grid label,
+.wi-middle-body label {
+  display: block;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.wi-overview-grid p {
+  margin: 4px 0 8px;
+}
+
+.wi-form-row {
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  gap: 8px;
+  align-items: start;
+  margin-bottom: 8px;
+}
+
+.wi-form-row textarea {
+  min-height: 96px;
+}
+
+.wi-ledger-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+.wi-ledger-table th,
+.wi-ledger-table td {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  padding: 4px 6px;
+  vertical-align: top;
+}
+
+.wi-ledger-table td {
+  font-size: 12px;
+}
+
+.wi-level-offer {
+  max-height: 640px;
+  overflow: auto;
+}
+
+.wi-offer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 10px;
+}
+
+.wi-skill-table .wi-mini {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.wi-skill-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}

@@ -19,7 +19,11 @@ export async function apiRequest(path, options = {}) {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`API ${path} failed (${response.status}): ${text}`);
+    const err = new Error(`API ${path} failed (${response.status}): ${text}`);
+    err.status = Number(response.status || 0);
+    err.path = String(path || "");
+    err.responseText = text;
+    throw err;
   }
   return response.json();
 }

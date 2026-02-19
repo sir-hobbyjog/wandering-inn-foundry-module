@@ -108,8 +108,17 @@ function renderNpcPanel(state) {
         const next = panelStateFromHtml(html);
         const actor = game.actors.get(String(html.find("#wi-actor").val() || ""));
         if (!actor) return;
-        await pullCombatToActor(actor, { levelOverride: Number(html.find("#wi-level").val() || 1) });
-        ui.notifications.info("Combat profile applied to actor");
+        try {
+          await pullCombatToActor(actor, { levelOverride: Number(html.find("#wi-level").val() || 1) });
+          ui.notifications.info("Combat profile applied to actor");
+        } catch (err) {
+          const msg = String(err?.responseText || err?.message || "");
+          if (Number(err?.status || 0) === 404 && msg.includes("binding not found")) {
+            ui.notifications.error("Actor is not bound to an NPC yet. Use Bind Actor first.");
+          } else {
+            ui.notifications.error(`Pull Combat failed: ${msg}`);
+          }
+        }
         renderNpcPanel(next);
       }
     },
@@ -238,7 +247,16 @@ export function registerNpcPanel() {
       ui.notifications.warn("Select a token first.");
       return;
     }
-    await pullCombatToActor(actor, {});
-    ui.notifications.info(`Pulled combat profile for ${actor.name}.`);
+    try {
+      await pullCombatToActor(actor, {});
+      ui.notifications.info(`Pulled combat profile for ${actor.name}.`);
+    } catch (err) {
+      const msg = String(err?.responseText || err?.message || "");
+      if (Number(err?.status || 0) === 404 && msg.includes("binding not found")) {
+        ui.notifications.error("Selected actor is not bound to an NPC. Open NPC Panel and bind first.");
+        return;
+      }
+      ui.notifications.error(`Pull combat failed: ${msg}`);
+    }
   };
 }

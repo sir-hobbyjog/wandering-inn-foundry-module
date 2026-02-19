@@ -3,6 +3,8 @@ import { registerActorSyncHook } from "./actor-sync.js";
 import { registerNpcPanel } from "./chat-ui.js";
 import { registerDmConsole } from "./dm-console.js";
 import { registerProgressionTools } from "./progression.js";
+import { registerGmDashboard } from "./gm-dashboard.js";
+import { registerPlayerProgression } from "./player-progression.js";
 
 const MODULE_ID = "wi-core-foundry";
 
@@ -185,6 +187,17 @@ function registerKeybindings() {
       return true;
     }
   });
+
+  game.keybindings.register(MODULE_ID, "openGmDashboard", {
+    name: "Open GM Dashboard",
+    hint: "GM-only shortcut: open the 3-pane progression dashboard.",
+    restricted: true,
+    editable: [{ key: "KeyG", modifiers: ["Shift", "Alt"] }],
+    onDown: () => {
+      game.wiCore.openGmDashboard().catch((err) => console.error("[wi-core-foundry] GM dashboard hotkey failed", err));
+      return true;
+    }
+  });
 }
 
 function registerSceneControlButton() {
@@ -194,6 +207,7 @@ function registerSceneControlButton() {
     if (!tokenControls) return;
     const alreadyPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenDmConsole");
     const progressionPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenProgressionEditor");
+    const dashboardPresent = (tokenControls.tools || []).some((t) => t.name === "wiCoreOpenGmDashboard");
     if (!alreadyPresent) {
       tokenControls.tools.push({
         name: "wiCoreOpenDmConsole",
@@ -219,6 +233,19 @@ function registerSceneControlButton() {
         }
       });
     }
+
+    if (!dashboardPresent) {
+      tokenControls.tools.push({
+        name: "wiCoreOpenGmDashboard",
+        title: "Open WI GM Dashboard",
+        icon: "fas fa-columns",
+        button: true,
+        visible: true,
+        onClick: () => {
+          game.wiCore.openGmDashboard().catch((err) => console.error("[wi-core-foundry] scene control GM dashboard failed", err));
+        }
+      });
+    }
   });
 }
 
@@ -227,6 +254,8 @@ Hooks.once("init", () => {
   registerNpcPanel();
   registerDmConsole();
   registerProgressionTools();
+  registerGmDashboard();
+  registerPlayerProgression();
   registerKeybindings();
   registerSceneControlButton();
 });
@@ -245,5 +274,6 @@ Hooks.once("ready", async () => {
   game.wiCore.openNpcPanel = game.wiCore.openNpcPanel || (() => {});
   game.wiCore.openDmConsole = game.wiCore.openDmConsole || (async () => {});
   game.wiCore.openProgressionEditor = game.wiCore.openProgressionEditor || (async () => {});
+  game.wiCore.openGmDashboard = game.wiCore.openGmDashboard || (async () => {});
   game.wiCore.pullCombatSelected = game.wiCore.pullCombatSelected || (async () => {});
 });
